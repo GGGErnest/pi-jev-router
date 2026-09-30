@@ -34,7 +34,7 @@ const usage = { input: 100, output: 10, cacheRead: 50, cacheWrite: 0, totalToken
 const user = (text, timestamp = 1) => ({ role: "user", content: text, timestamp });
 const context = (text = "Fix a typo", timestamp = 1) => ({ systemPrompt: "PRIVATE SYSTEM INSTRUCTIONS", tools: [], messages: [user(text, timestamp)] });
 
-async function harness({ refs = [FAST, DEEP], gatewayKey = true, openrouterKey = false, backendError = false, incomplete = false, auth, history = [], sessionId = "main", responsesPayload = false } = {}) {
+async function harness({ refs = [FAST, DEEP], gatewayKey = true, openrouterKey = false, backendError = false, incomplete = false, auth, history = [], sessionId = "main", responsesPayload = false, contextTokens = null } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const calls = [], entries = structuredClone(history), notices = [];
@@ -91,6 +91,7 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, openrouterKey =
 		cwd: agentDir,
 		getSystemPrompt: () => "PRIVATE SYSTEM INSTRUCTIONS",
 		modelRegistry: registry,
+		getContextUsage: () => ({ tokens: contextTokens, contextWindow: ctx.model?.contextWindow ?? 128_000, percent: null }),
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getEntries: () => entries.map(({ name, data }) => ({ type: "custom", customType: name, data })),
@@ -422,7 +423,8 @@ test("active router limits follow the backend without rerouting continuations or
 	Object.assign(h.models[0], { contextWindow: 128000, maxTokens: 8192, input: ["text"] });
 	Object.assign(h.models[1], { contextWindow: 1000000, maxTokens: 64000 });
 	await h.handlers.get("session_start")({}, h.ctx);
-	assert.equal(h.ctx.model.contextWindow, 128000, "startup limits remain conservative until routing");
+	assert.equal(h.ctx.getContextUsage().tokens, null, "Pi may report unknown context immediately after compaction");
+	assert.equal(h.ctx.model.contextWindow, 1_000_000, "the router advertises the largest route window before selection");
 	const initialRouter = h.ctx.model;
 
 	let windowAtGeneration;
@@ -457,6 +459,74 @@ test("active router limits follow the backend without rerouting continuations or
 	await h.handlers.get("session_start")({ reason: "reload" }, h.ctx);
 	assert.equal(h.ctx.model.contextWindow, 256000, "reload restores the pinned backend's limits before generation");
 	assert.equal(requests.length, 2);
+});
+
+test("large resumed contexts retain the largest router window and exclude undersized routes", async (t) => {
+	const requests = mockGateway(t, () => DEEP);
+	const h = await harness({ contextTokens: 200_000 });
+	Object.assign(h.models[0], { contextWindow: 128_000, maxTokens: 8192, input: ["text"] });
+	Object.assign(h.models[1], { contextWindow: 1_000_000, maxTokens: 64_000 });
+	await h.handlers.get("session_start")({ reason: "resume" }, h.ctx);
+	assert.equal(h.ctx.model.contextWindow, 1_000_000);
+
+	const result = await h.stream().result();
+	assert.equal(result.model, "gpt-6-astra");
+	assert.equal(h.calls.length, 1);
+	assert.equal(h.calls[0].model.contextWindow, 1_000_000);
+	assert.equal(requests.length, 0, "the only context-capable route is selected without an evaluator request");
+});
+
+test("context route eligibility matches Pi's compaction reserve boundary", async (t) => {
+	const requests = mockGateway(t, () => FAST);
+	const resumed = async (contextTokens) => {
+		const h = await harness({ contextTokens });
+		Object.assign(h.models[0], { contextWindow: 128_000, maxTokens: 8192 });
+		Object.assign(h.models[1], { contextWindow: 1_000_000, maxTokens: 64_000 });
+		await h.handlers.get("session_start")({ reason: "resume" }, h.ctx);
+		return h;
+	};
+
+	const atBoundary = await resumed(111_616);
+	assert.equal((await atBoundary.stream().result()).model, "gpt-5.6-luna", "equality with Pi's reserve boundary remains eligible");
+	assert.equal(requests.length, 1);
+
+	const overBoundary = await resumed(111_617);
+	assert.equal((await overBoundary.stream().result()).model, "gpt-6-astra", "one token beyond the reserve excludes the small route");
+	assert.equal(requests.length, 1, "the sole eligible route needs no Jev evaluation");
+});
+
+test("refuses to send a context that exceeds every Jev route", async (t) => {
+	const requests = mockGateway(t, () => DEEP);
+	const h = await harness({ contextTokens: 1_000_000 });
+	Object.assign(h.models[0], { contextWindow: 128_000, maxTokens: 8192 });
+	Object.assign(h.models[1], { contextWindow: 1_000_000, maxTokens: 64_000 });
+	await h.handlers.get("session_start")({ reason: "resume" }, h.ctx);
+
+	const result = await h.stream().result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage, /exceeds every Jev route/);
+	assert.match(result.errorMessage, /reserving 16384 tokens.*largest route window: 1000000/);
+	assert.equal(h.calls.length, 0, "an oversized context is never sent to a backend");
+	assert.equal(requests.length, 0, "an oversized context is rejected before Jev evaluation");
+	assert.equal(h.entries.length, 0, "an invalid context does not pin a route");
+});
+
+test("reports when a resumed context cannot fit its existing Jev pin", async (t) => {
+	const requests = mockGateway(t, () => DEEP);
+	const h = await harness({
+		contextTokens: 200_000,
+		history: [{ name: "jev-pin", data: { target: FAST, thinking: "low", sessionId: "main", key: "saved-key" } }],
+	});
+	Object.assign(h.models[0], { contextWindow: 128_000, maxTokens: 8192 });
+	Object.assign(h.models[1], { contextWindow: 1_000_000, maxTokens: 64_000 });
+	await h.handlers.get("session_start")({ reason: "resume" }, h.ctx);
+
+	const result = await h.stream().result();
+	assert.equal(result.stopReason, "error");
+	assert.match(result.errorMessage, /Pinned Jev route .*cannot fit.*session pin is preserved/);
+	assert.equal(h.calls.length, 0, "a context-incompatible pin is never sent to a backend");
+	assert.equal(requests.length, 0, "a pinned route is not silently replaced by Jev");
+	assert.equal(h.entries.length, 1, "the existing session pin is preserved without another entry");
 });
 
 test("Jev chooses automatic effort once, and pins it across messages and auxiliary calls", async (t) => {

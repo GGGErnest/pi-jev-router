@@ -55,6 +55,8 @@ Merge `jevRouter` into **global** `~/.pi/agent/settings.json`, then `/reload`:
 
 Only listed, authenticated models are eligible; `fallback` must be listed too. Routes replace the default list; they aren't merged. `PI_CODING_AGENT_DIR` is respected; project settings cannot override routing.
 
+The virtual `auto/jev` model advertises the largest available configured route window so Pi doesn't compact a large resumed session before Jev can route it. When Pi reports a context estimate, Jev only sees routes that can fit with a response reserve. Pi may briefly report usage as unknown immediately after compaction; in that case routing leaves the candidates unfiltered because the context has just been reduced. If a known estimate fits no route—or an existing session pin is too small—the extension fails clearly rather than silently sending an oversized context or switching the pin; compact the session or fork to choose a larger-context model.
+
 `jevRouter.evaluationProvider` selects where Jev evaluations run: `"vercel-ai-gateway"` (default) or `"openrouter"`. It is chosen **only** from this setting — the extension never auto-detects or falls back to the other provider. A missing key for the selected provider fails closed with guidance naming its `/login` command and environment variable (`AI_GATEWAY_API_KEY` or `OPENROUTER_API_KEY`). Credentials always come from Pi's registry, never from `settings.json`.
 
 Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.

@@ -44,6 +44,8 @@ const CHUNK_CONCURRENCY = 2;
 const MAX_ROUTING_FAILURES = 4;
 const MAX_FAILURE_EXCERPT = 512;
 const POOR_FIT_THRESHOLD = 0.85;
+// Keep aligned with Pi's default compaction reserve (16,384 tokens).
+const CONTEXT_RESERVE_TOKENS = 16_384;
 
 class RoutingBudgetError extends Error {}
 class EvaluationAuthError extends Error {}
@@ -526,7 +528,8 @@ export default function jevRouter(pi: ExtensionAPI) {
 				reasoning: true,
 				thinkingLevelMap: { xhigh: "xhigh", max: "max" },
 				input: models.some((model) => model.input.includes("image")) ? ["text", "image"] : ["text"],
-				contextWindow: target?.contextWindow ?? (models.length ? Math.min(...models.map((model) => model.contextWindow)) : 128_000),
+				// Advertise the largest allowed route so Pi doesn't compact a resumed context before routing.
+				contextWindow: target?.contextWindow ?? (models.length ? Math.max(...models.map((model) => model.contextWindow)) : 128_000),
 				maxTokens: target?.maxTokens ?? (models.length ? Math.min(...models.map((model) => model.maxTokens)) : 16_384),
 				cost: ZERO_COST,
 			}],
@@ -808,8 +811,23 @@ export default function jevRouter(pi: ExtensionAPI) {
 				if (options.deferred) throw new Error("Select a concrete model for deferred generation; auto/jev does not support it.");
 				const ctx = active;
 				const hasImages = context.messages.some((item) => Array.isArray(item.content) && item.content.some((part) => part.type === "image"));
-				const available = candidates(ctx).filter((candidate) => !hasImages || candidate.input.includes("image"));
-				if (!available.length) throw new Error("No authenticated Jev routes can handle this input. Check jevRouter in global settings.json and /login.");
+				const routable = candidates(ctx).filter((candidate) => !hasImages || candidate.input.includes("image"));
+				if (!routable.length) throw new Error("No authenticated Jev routes can handle this input. Check jevRouter in global settings.json and /login.");
+				const contextTokens = ctx.getContextUsage?.()?.tokens;
+				const knownContext = typeof contextTokens === "number" && Number.isSafeInteger(contextTokens) && contextTokens >= 0;
+				// Pi reports null just after compaction until another assistant response; in that case compaction has already reduced the context.
+				const available = knownContext
+					? routable.filter((candidate) => candidate.contextWindow - contextTokens >= CONTEXT_RESERVE_TOKENS)
+					: routable;
+				const pinnedTarget = pinned?.target;
+				const pinnedCandidate = pinnedTarget ? routable.find((candidate) => `${candidate.provider}/${candidate.id}` === pinnedTarget) : undefined;
+				if (knownContext && pinnedTarget && pinnedCandidate && !available.includes(pinnedCandidate)) {
+					throw new Error(`Pinned Jev route ${pinnedTarget} cannot fit the current context estimate (${contextTokens} tokens; ${pinnedCandidate.contextWindow} window, ${CONTEXT_RESERVE_TOKENS} reserved). The session pin is preserved; compact this session or fork and select a larger-context model.`);
+				}
+				if (!available.length) {
+					const largestWindow = Math.max(...routable.map((candidate) => candidate.contextWindow));
+					throw new Error(`Current context estimate (${contextTokens} tokens) exceeds every Jev route after reserving ${CONTEXT_RESERVE_TOKENS} tokens for generation (largest route window: ${largestWindow}). Compact the session or select a larger-context model.`);
+				}
 				const selection = await choose(ctx, context, available, options);
 				const target = available.find((candidate) => `${candidate.provider}/${candidate.id}` === selection.target);
 				if (!target) throw new Error("The pinned Jev route is unavailable or cannot handle this input. Fork or select a concrete model.");
