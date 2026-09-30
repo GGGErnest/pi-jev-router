@@ -14,15 +14,17 @@ Let [TypeSafe's Jev](https://vercel.com/ai-gateway/models/jev) choose a model an
 
 ## Get started
 
-Requires Pi **0.85.1+**, Node.js **22.19+**, and a **Vercel AI Gateway key**.
+Requires Pi **0.85.1+** and Node.js **22.19+**. Jev evaluations run through **OpenRouter** or the **Vercel AI Gateway**, selected by `jevRouter.evaluationProvider` (Gateway by default for backward compatibility).
 
 ```sh
 pi install npm:pi-jev-router
 ```
 
-Git also works: `pi install git:github.com/mejiasd3v/pi-jev-router`. Keep only one installation.
+Git also works: `pi install git:github.com/mejiasd3v/pi-jev-router`. For the OpenRouter-enabled feature branch in your fork, install `git:github.com/GGGErnest/pi-jev-router@feat/evidence-guided-routing` instead. Keep only one installation; this feature branch is not published to npm.
 
-1. Use `/login` for your generation provider and `/login vercel-ai-gateway` for Jev. `AI_GATEWAY_API_KEY` also works.
+1. Use `/login` for your generation provider. For Jev, configure the provider in `jevRouter.evaluationProvider` and authenticate it:
+   - `"vercel-ai-gateway"` (default): `/login vercel-ai-gateway`; `AI_GATEWAY_API_KEY` also works.
+   - `"openrouter"`: `/login openrouter`; `OPENROUTER_API_KEY` also works. OpenRouter serves Jev through its Decisions API.
 2. Run `/reload`, then `/model auto/jev`.
 3. Start with your actual task. `/jev` shows the pin, selected effort, and fork suggestions.
 
@@ -52,6 +54,8 @@ Merge `jevRouter` into **global** `~/.pi/agent/settings.json`, then `/reload`:
 ```
 
 Only listed, authenticated models are eligible; `fallback` must be listed too. Routes replace the default list; they aren't merged. `PI_CODING_AGENT_DIR` is respected; project settings cannot override routing.
+
+`jevRouter.evaluationProvider` selects where Jev evaluations run: `"vercel-ai-gateway"` (default) or `"openrouter"`. It is chosen **only** from this setting — the extension never auto-detects or falls back to the other provider. A missing key for the selected provider fails closed with guidance naming its `/login` command and environment variable (`AI_GATEWAY_API_KEY` or `OPENROUTER_API_KEY`). Credentials always come from Pi's registry, never from `settings.json`.
 
 Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.
 
@@ -131,11 +135,11 @@ Context limits follow the pinned backend. The status and `/jev` show its current
 
 ## Privacy and cost
 
-Routing and monitoring consider up to **eight recent user/assistant text messages**, limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to Vercel/TypeSafe. Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, images, tool arguments, and successful tool output are excluded. When monitoring sees new failed-tool evidence during an active task with routing text, it additionally sends up to **four** tool names, error flags, and excerpts capped at **512 characters** each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Adaptive effort can send the same bounded failure evidence when enabled. **Conversation text is not redacted and may contain sensitive information.**
+Routing and monitoring consider up to **eight recent user/assistant text messages**, limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to the configured evaluator (`vercel-ai-gateway` serves Vercel/TypeSafe; `openrouter` sends them to OpenRouter's Decisions API). Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, images, tool arguments, and successful tool output are excluded. When monitoring sees new failed-tool evidence during an active task with routing text, it additionally sends up to **four** tool names, error flags, and excerpts capped at **512 characters** each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Adaptive effort can send the same bounded failure evidence when enabled. **Conversation text is not redacted and may contain sensitive information.**
 
-Opt-in skill selection additionally sends eligible skill names and descriptions to Vercel/TypeSafe. Skill file contents are read locally and stored in the session; automatically injected skill messages are excluded from subsequent Jev evaluations. Manually pasted or expanded skill instructions in user messages remain conversation text.
+Opt-in skill selection additionally sends eligible skill names and descriptions to the configured evaluator (Vercel/TypeSafe or OpenRouter). Skill file contents are read locally and stored in the session; automatically injected skill messages are excluded from subsequent Jev evaluations. Manually pasted or expanded skill instructions in user messages remain conversation text.
 
-Gateway evaluations are billed separately. Chunking uses at most nine evaluations before timeout retries, or 27 attempts total. `/jev` estimates sum returned usage; failed, cancelled, or timed-out calls may still be billed. Skill-selection evaluations are additional and are not included in `/jev` routing estimates. Evaluation costs are not in Pi's footer totals. Pinning favors cache reuse but guarantees neither cache hits nor savings.
+Evaluator requests are billed separately by the configured provider (Vercel AI Gateway or OpenRouter). Chunked routing can require up to **nine evaluation requests** (eight chunks plus a combined decision). Authentication, chunks, retries, and the combined request share a wall-clock ceiling of **3 × `timeoutMs`** (15 seconds by default); the full per-request timeout is not multiplied by the chunk count. `/jev` estimates sum returned usage; failed, cancelled, or timed-out calls may still be billed. Skill-selection evaluations are additional and are not included in `/jev` routing estimates. Evaluation costs are not in Pi's footer totals. Pinning favors cache reuse but guarantees neither cache hits nor savings.
 
 <details>
 <summary>Migrating from file-based configuration</summary>

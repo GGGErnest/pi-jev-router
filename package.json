@@ -1,7 +1,7 @@
 {
   "name": "pi-jev-router",
   "version": "0.5.0",
-  "description": "Automatic model routing for Pi using TypeSafe's Jev through Vercel AI Gateway",
+  "description": "Automatic model routing for Pi using TypeSafe's Jev through Vercel AI Gateway or OpenRouter",
   "license": "MIT",
   "author": "MejiasDev",
   "repository": {
@@ -32,6 +32,7 @@
     "@earendil-works/pi-coding-agent": "0.85.1"
   },
   "dependencies": {
+    "@openrouter/ai-sdk-provider": "3.1.0",
     "ai": "7.0.105",
     "zod": "4.6.5"
   }

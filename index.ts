@@ -14,11 +14,23 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { getAgentDir, stripFrontmatter, type ContextEvent, type ExtensionAPI, type ExtensionContext, type Skill } from "@earendil-works/pi-coding-agent";
+import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createGateway, experimental_evaluate as evaluate } from "ai";
 
 const PROVIDER = "auto";
 const MODEL = "jev";
-const GATEWAY = "vercel-ai-gateway";
+type EvaluationProvider = "openrouter" | "vercel-ai-gateway";
+// Jev evaluations run through exactly one configured provider. The provider is
+// chosen only from jevRouter.evaluationProvider; a missing key fails closed and
+// is never replaced by the other provider's credentials.
+const EVALUATION_MODEL: Record<EvaluationProvider, string> = {
+	openrouter: "typesafe/jev-1.13",
+	"vercel-ai-gateway": "typesafe-ai/jev",
+};
+const EVALUATION_CREDENTIALS: Record<EvaluationProvider, { login: string; env: string }> = {
+	openrouter: { login: "/login openrouter", env: "OPENROUTER_API_KEY" },
+	"vercel-ai-gateway": { login: "/login vercel-ai-gateway", env: "AI_GATEWAY_API_KEY" },
+};
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const EVALUATION_ATTEMPTS = 3;
@@ -34,6 +46,7 @@ const MAX_FAILURE_EXCERPT = 512;
 const POOR_FIT_THRESHOLD = 0.85;
 
 class RoutingBudgetError extends Error {}
+class EvaluationAuthError extends Error {}
 
 function fitsEvaluation(state: unknown, questions: unknown) {
 	return Buffer.byteLength(JSON.stringify({ state, questions, providerOptions: {} }), "utf8") <= EVALUATION_BYTES;
@@ -53,7 +66,7 @@ type ThinkingChoices = Partial<Record<ModelThinkingLevel, string>>;
 type RouteCriteria = { role: string; use_when: string[]; not_for: string[]; boundary: string };
 type RouteOption = { description: string | RouteCriteria; thinking?: ModelThinkingLevel | "auto" | ThinkingChoices; minThinking?: ModelThinkingLevel; adaptiveThinking?: boolean };
 type RouteProfile = { target: string; thinking: ModelThinkingLevel; description: { model: string; task: string | RouteCriteria; thinking?: ModelThinkingLevel; effort: string; keepCurrentModel?: boolean } };
-type Config = { options: Record<string, RouteOption>; fallback: string; timeoutMs: number; monitor: boolean; skills: boolean; minThinking?: ModelThinkingLevel };
+type Config = { options: Record<string, RouteOption>; fallback: string; timeoutMs: number; monitor: boolean; skills: boolean; evaluationProvider: EvaluationProvider; minThinking?: ModelThinkingLevel };
 const DEFAULT_CONFIG: Config = {
 	options: {
 		"openai-codex/gpt-5.6-luna": {
@@ -73,6 +86,7 @@ const DEFAULT_CONFIG: Config = {
 	timeoutMs: 5000,
 	monitor: true,
 	skills: false,
+	evaluationProvider: "vercel-ai-gateway",
 };
 type Selection = {
 	target: string;
@@ -150,7 +164,11 @@ export function parseConfig(value: unknown): Config {
 	if (typeof monitor !== "boolean") throw new Error("Jev monitor must be a boolean.");
 	const skills = value.skills === undefined ? false : value.skills;
 	if (typeof skills !== "boolean") throw new Error("Jev skills must be a boolean.");
-	return { options, fallback: value.fallback, timeoutMs, monitor, skills, minThinking: parseMinThinking(value.minThinking, "global floor") };
+	const evaluationProvider = value.evaluationProvider === undefined ? "vercel-ai-gateway" : value.evaluationProvider;
+	if (evaluationProvider !== "openrouter" && evaluationProvider !== "vercel-ai-gateway") {
+		throw new Error("Jev evaluationProvider must be \"openrouter\" or \"vercel-ai-gateway\".");
+	}
+	return { options, fallback: value.fallback, timeoutMs, monitor, skills, evaluationProvider, minThinking: parseMinThinking(value.minThinking, "global floor") };
 }
 
 function thinkingProfiles(model: Model<Api>, route: RouteOption, minimum: ModelThinkingLevel | undefined, inherited: ModelThinkingLevel = "off") {
@@ -329,6 +347,19 @@ async function abortable<T>(work: () => Promise<T>, signal?: AbortSignal): Promi
 	}
 }
 
+// Shared Jev evaluation setup: resolve the configured provider's key through Pi's
+// model-registry auth (never through settings.json) and build its evaluation model.
+async function evaluationModel(registry: { getProviderAuth(provider: string): Promise<{ auth?: { apiKey?: string } } | undefined> }, provider: EvaluationProvider, signal?: AbortSignal) {
+	const auth = await abortable(() => registry.getProviderAuth(provider), signal);
+	if (!auth?.auth?.apiKey) {
+		const { login, env } = EVALUATION_CREDENTIALS[provider];
+		throw new EvaluationAuthError(`Jev evaluation provider "${provider}" is not authenticated. Configure ${login} or set ${env}.`);
+	}
+	return provider === "openrouter"
+		? createOpenRouter({ apiKey: auth.auth.apiKey }).evaluationModel(EVALUATION_MODEL[provider])
+		: createGateway({ apiKey: auth.auth.apiKey }).evaluationModel(EVALUATION_MODEL[provider]);
+}
+
 type LoadedSkill = { name: string; path: string; content: string };
 
 function isLoadedSkill(value: unknown): value is LoadedSkill {
@@ -447,9 +478,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		try {
 			while (input.messages.length > 1 && !fitsEvaluation({ messages: input.messages }, questions)) input.messages.shift();
 			if (!fitsEvaluation({ messages: input.messages }, questions)) throw new Error("skill evaluation budget exceeded");
-			const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-			if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-			const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+			const model = await evaluationModel(ctx.modelRegistry, config.evaluationProvider, signal);
 			const result = await abortable(() => evaluate({ model, state: { messages: input.messages }, questions, abortSignal: signal, maxRetries: 0 }), signal);
 			signal.throwIfAborted();
 			const ranked = offered.map((skill, index) => ({ skill, probability: result.answers[String(index)]?.probability }));
@@ -558,9 +587,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 				if (!fitsEvaluation(state, questions)) throw new Error("effort evaluation budget exceeded");
 				if (profiles.length === 1) thinking = profiles[0].thinking;
 				else {
-					const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-					if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-					const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+					const model = await evaluationModel(ctx.modelRegistry, config.evaluationProvider, signal);
 					const result = await abortable(() => evaluate({ model, state, questions, abortSignal: signal, maxRetries: 0 }), signal);
 					signal.throwIfAborted();
 					const selected = profiles.find((profile) => profile.thinking === result.answers.effort.choice);
@@ -686,9 +713,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 					chunks = chunkRoutingText(messages[messages.length - 1].text, chunkQuestions, failures);
 					metrics.routingChunks = chunks.length;
 				}
-				const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-				if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-				const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+				const model = await evaluationModel(ctx.modelRegistry, config.evaluationProvider, signal);
 				async function evaluateRequest(state: Parameters<typeof evaluate>[0]["state"], requestQuestions = questions) {
 					if (!fitsEvaluation(state, requestQuestions)) throw new RoutingBudgetError("routing request exceeds the evaluation budget");
 					for (let attempt = 1; ; attempt++) {
@@ -742,8 +767,9 @@ export default function jevRouter(pi: ExtensionAPI) {
 				// Never expose SDK error bodies: they may contain conversation text.
 				options.signal?.throwIfAborted();
 				const status = isRecord(error) && typeof error.statusCode === "number" ? error.statusCode : undefined;
-				const reason = status === 401 ? "Gateway rejected credentials (401); update the Gateway key" :
-					status ? `Jev request failed (HTTP ${status})` : "Jev unavailable; check Gateway login/key and connectivity";
+				const label = config.evaluationProvider === "openrouter" ? "OpenRouter" : "Gateway";
+				const reason = error instanceof EvaluationAuthError ? error.message : status === 401 ? `${label} rejected credentials (401); update the ${label} key` :
+					status ? `Jev request failed (HTTP ${status})` : `Jev unavailable; check ${label} login/key and connectivity`;
 				selection = fallback(error instanceof RoutingBudgetError ? error.message :
 					deadline.aborted || (error instanceof Error && error.name === "TimeoutError") ? "Jev timed out" : reason);
 			} finally {
@@ -877,13 +903,15 @@ export default function jevRouter(pi: ExtensionAPI) {
 		description: "Show the pinned Jev model, current effort, and fork suggestions",
 		handler: async (_args, ctx) => {
 			const routes = Object.entries(config.options).map(([ref, route]) => `${ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");
-			const gateway = ctx.modelRegistry.getProviderAuthStatus(GATEWAY).configured ? "configured" : "missing: /login vercel-ai-gateway";
+			const { login, env } = EVALUATION_CREDENTIALS[config.evaluationProvider];
+			const evaluator = ctx.modelRegistry.getProviderAuthStatus(config.evaluationProvider).configured ? "configured" : `missing: ${login} or ${env}`;
 			const pin = pinned ? `${pinned.target}, thinking ${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking} (initial ${pinned.thinking})` : "not yet selected";
 			const last = lastRoute ? lastRoute.purpose === "monitor" && lastRoute.source === "fallback"
 				? `\nLast monitor failed: ${lastRoute.reason}. Keeping the session pin.`
 				: `\nLast ${lastRoute.purpose}: ${lastRoute.target}, thinking ${lastRoute.thinking} (${lastRoute.source}, ${lastRoute.milliseconds}ms, evaluations: ${lastRoute.evaluationRequests ?? 0}${lastRoute.routingChunks ? `, chunks planned: ${lastRoute.routingChunks}` : ""}, estimated Jev $${lastRoute.estimatedCost.toFixed(6)}${lastRoute.usageIncomplete ? "; usage incomplete" : ""})` : "";
 			const suggestion = lastSuggestion ? `\nFork suggestion: ${lastSuggestion.target}, thinking ${lastSuggestion.thinking}` : "";
-			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}\nGateway: ${gateway}${last}${suggestion}\nConfig: ${configSource}\nEdit jevRouter in ${settingsPath}, then /reload. Model and initial-effort changes apply to new sessions. Adaptive effort applies after reload.`, "info");
+			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}
+Evaluator: ${config.evaluationProvider} (${evaluator})${last}${suggestion}\nConfig: ${configSource}\nEdit jevRouter in ${settingsPath}, then /reload. Model and initial-effort changes apply to new sessions. Adaptive effort applies after reload.`, "info");
 		},
 	});
 }

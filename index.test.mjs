@@ -34,7 +34,7 @@ const usage = { input: 100, output: 10, cacheRead: 50, cacheWrite: 0, totalToken
 const user = (text, timestamp = 1) => ({ role: "user", content: text, timestamp });
 const context = (text = "Fix a typo", timestamp = 1) => ({ systemPrompt: "PRIVATE SYSTEM INSTRUCTIONS", tools: [], messages: [user(text, timestamp)] });
 
-async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = false, incomplete = false, auth, history = [], sessionId = "main", responsesPayload = false } = {}) {
+async function harness({ refs = [FAST, DEEP], gatewayKey = true, openrouterKey = false, backendError = false, incomplete = false, auth, history = [], sessionId = "main", responsesPayload = false } = {}) {
 	const handlers = new Map();
 	const commands = new Map();
 	const calls = [], entries = structuredClone(history), notices = [];
@@ -78,10 +78,12 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 		getAvailable: () => models,
 		getProvider: () => backend,
 		getProviderAuth: async (provider) => {
-			assert.equal(provider, "vercel-ai-gateway");
-			return gatewayKey ? { auth: { apiKey: "gateway-test-key" } } : undefined;
+			assert.ok(provider === "vercel-ai-gateway" || provider === "openrouter", `unexpected provider ${provider}`);
+			return provider === "openrouter"
+				? openrouterKey ? { auth: { apiKey: "openrouter-test-key" } } : undefined
+				: gatewayKey ? { auth: { apiKey: "gateway-test-key" } } : undefined;
 		},
-		getProviderAuthStatus: () => ({ configured: gatewayKey }),
+		getProviderAuthStatus: (provider) => ({ configured: provider === "openrouter" ? openrouterKey : gatewayKey }),
 		getApiKeyAndHeaders: auth ?? (async () => ({ ok: true, apiKey: "codex-test-key", headers: { "x-backend": "yes" }, env: { BACKEND: "yes" }, baseUrl: "https://backend.example.invalid" })),
 		find: (provider, id) => provider === "auto" ? { ...registration.models[0], provider, api: registration.api, baseUrl: registration.baseUrl } : models.find((model) => model.provider === provider && model.id === id),
 	};
@@ -165,6 +167,52 @@ function mockSkillGateway(t, probabilities = {}) {
 		}])), usage: { inputTokens: 1000, outputTokens: 0 },
 	}));
 }
+
+function mockOpenRouter(t, respond = () => FAST) {
+	const previous = globalThis.fetch;
+	const requests = [];
+	globalThis.fetch = async (url, options) => {
+		assert.equal(String(url), "https://openrouter.ai/api/alpha/decisions");
+		assert.equal(new Headers(options.headers).get("authorization"), "Bearer openrouter-test-key");
+		const body = JSON.parse(options.body);
+		assert.equal(body.model, "typesafe/jev-1.13");
+		requests.push(body);
+		const result = await respond(options, body);
+		if (result instanceof Response) return result;
+		if (body.questions.effort) return Response.json({
+			id: "decision-1", model: "typesafe/jev-1.13", provider: "OpenRouter",
+			answers: { effort: { type: "choice", choice: typeof result === "string" ? result : result.thinking } },
+			usage: { input_tokens: 1000, output_tokens: 0 },
+		});
+		if (!body.questions.route) {
+			const probabilities = typeof result === "object" && result !== null ? result : {};
+			return Response.json({
+				id: "decision-1", model: "typesafe/jev-1.13", provider: "OpenRouter",
+				answers: Object.fromEntries(Object.entries(body.questions).map(([id, question]) => [id, {
+					type: "noul", noul: probabilities[question.criteria.true.name] ?? 0.95,
+				}])), usage: { input_tokens: 1000, output_tokens: 0 },
+			});
+		}
+		const desired = typeof result === "string" ? { target: result } : result;
+		const choice = Object.entries(body.questions.route.criteria).find(([, profile]) =>
+			profile.model === desired.target && (desired.thinking === undefined || profile.thinking === desired.thinking))?.[0] ?? "unoffered-profile";
+		const answers = { route: { type: "choice", choice } };
+		if (body.questions.poorFit) answers.poorFit = { type: "noul", noul: desired.poorFitProbability ?? 0.05 };
+		return Response.json({ id: "decision-1", model: "typesafe/jev-1.13", provider: "OpenRouter", answers, usage: { input_tokens: 1000, output_tokens: 0 } });
+	};
+	t.after(() => { globalThis.fetch = previous; });
+	return requests;
+}
+
+function mockSkillOpenRouter(t, probabilities = {}) {
+	return mockOpenRouter(t, (_options, body) => Response.json({
+		id: "decision-1", model: "typesafe/jev-1.13", provider: "OpenRouter",
+		answers: Object.fromEntries(Object.entries(body.questions).map(([id, question]) => [id, {
+			type: "noul", noul: probabilities[question.criteria.true.name] ?? 0.95,
+		}])), usage: { input_tokens: 1000, output_tokens: 0 },
+	}));
+}
+
 
 const skillContext = (h, messages) => h.handlers.get("context")({ messages }, h.ctx);
 
@@ -1352,4 +1400,146 @@ test("validates config and bounds routing text without sending thinking, tools, 
 	assert.deepEqual(routingInput(rich).messages, [{ role: "assistant", text: "Previous answer" }, { role: "user", text: "Fix a typo" }]);
 	assert.equal(routingInput(context("x".repeat(16001))).messages[0].text.length, 16001);
 	assert.match(routingInput(context("x".repeat(192001))).reason, /routing limit/);
+});
+test("explicit OpenRouter configuration routes and monitors through the Decisions API", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine", thinking: "max" }, [DEEP]: { description: "Deep", thinking: "xhigh" } },
+		fallback: DEEP, evaluationProvider: "openrouter",
+	} }));
+	let desired = FAST;
+	const requests = mockOpenRouter(t, () => desired);
+	const h = await harness({ openrouterKey: true });
+	await h.stream().result();
+	assert.equal(h.calls[0].model.id, "gpt-5.6-luna");
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0].model, "typesafe/jev-1.13", "the Decisions body must name the OpenRouter Jev model");
+	assert.deepEqual(Object.values(requests[0].questions.route.criteria).map(({ model, thinking }) => [model, thinking]), [[FAST, "max"], [DEEP, "xhigh"]]);
+	assert.equal(h.entries[0].data.inputTokens, 1000);
+	assert.equal(h.entries[0].data.source, "jev");
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-pin").length, 1);
+	desired = { target: DEEP, thinking: "xhigh", poorFitProbability: 0.95 };
+	assert.equal((await h.stream(context("Harder task", 3)).result()).model, "gpt-5.6-luna", "a suggestion never switches the pin");
+	assert.equal(requests.length, 2, "monitoring also uses the OpenRouter evaluator");
+	assert.ok(requests[1].questions.poorFit);
+	assert.equal(requests[1].model, "typesafe/jev-1.13");
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-suggestion").length, 1);
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.target, FAST);
+});
+
+test("explicit Gateway configuration is the default and stays on the Gateway", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const base = { options: { [FAST]: { description: "Routine", thinking: "max" }, [DEEP]: { description: "Deep", thinking: "xhigh" } }, fallback: DEEP };
+	assert.equal(parseConfig(base).evaluationProvider, "vercel-ai-gateway");
+	const requests = mockGateway(t);
+	const h = await harness({ openrouterKey: true });
+	await h.stream().result();
+	assert.equal(h.calls[0].model.id, "gpt-5.6-luna");
+	assert.equal(requests.length, 1);
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { ...base, evaluationProvider: "vercel-ai-gateway" } }));
+	const explicit = await harness({ openrouterKey: true });
+	await explicit.stream().result();
+	assert.equal(explicit.calls[0].model.id, "gpt-5.6-luna");
+	assert.equal(requests.length, 2, "an explicit Gateway selection still uses the Gateway even when OpenRouter auth exists");
+});
+
+test("a missing selected evaluator key fails closed for routing, adaptive effort, and skills", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const config = { options: {
+		[FAST]: { description: "Routine", thinking: "auto" },
+		[DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true },
+	}, fallback: DEEP, evaluationProvider: "openrouter" };
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: config }));
+	const requests = mockOpenRouter(t);
+	const missing = await harness({ openrouterKey: false, gatewayKey: true });
+	assert.equal((await missing.stream().result()).model, "gpt-6-astra");
+	assert.equal(requests.length, 0, "no evaluator call is made without the selected provider's key");
+	assert.match(missing.entries[0].data.reason, /Configure \/login openrouter or set OPENROUTER_API_KEY/);
+	const history = [{ name: "jev-pin", data: { target: DEEP, thinking: "high", sessionId: "main" } }];
+	const effort = await harness({ refs: [DEEP], responsesPayload: true, history, openrouterKey: false });
+	await effort.stream(context()).result();
+	assert.equal(effort.calls[0].payload.reasoning.effort, "high");
+	assert.equal(requests.length, 0);
+	assert.match(effort.notices.at(-1)[0], /Keeping the current effort/);
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { ...config, skills: true } }));
+	const skills = await harness({ openrouterKey: false });
+	await setSkills(skills, [skillFixture("missing-key")]);
+	assert.equal((await skillContext(skills, [user("Use the skill")])).messages.length, 1);
+	assert.equal(requests.length, 0);
+});
+
+test("the selected evaluator is never silently replaced by the other provider's credentials", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const previous = globalThis.fetch;
+	const calls = [];
+	globalThis.fetch = async () => { calls.push("unexpected fetch"); throw new Error("no evaluator call expected"); };
+	t.after(() => { globalThis.fetch = previous; });
+	const config = { options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Deep" } }, fallback: DEEP };
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { ...config, evaluationProvider: "openrouter" } }));
+	const orSelected = await harness({ openrouterKey: false, gatewayKey: true });
+	assert.equal((await orSelected.stream().result()).model, "gpt-6-astra");
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { ...config, evaluationProvider: "vercel-ai-gateway" } }));
+	const gatewaySelected = await harness({ openrouterKey: true, gatewayKey: false });
+	assert.equal((await gatewaySelected.stream().result()).model, "gpt-6-astra");
+	assert.deepEqual(calls, []);
+});
+
+test("adaptive effort and skill selection use the configured OpenRouter evaluator", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const config = { minThinking: "medium", options: { [DEEP]: { description: "Deep work", thinking: "auto", adaptiveThinking: true } }, fallback: DEEP, evaluationProvider: "openrouter" };
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: config }));
+	let thinking = "medium";
+	const requests = mockOpenRouter(t, () => ({ target: DEEP, thinking }));
+	const h = await harness({ refs: [DEEP], responsesPayload: true, openrouterKey: true });
+	const input = context("Fix the failure");
+	await h.stream(input).result();
+	assert.equal(h.calls[0].options.reasoning, "medium");
+	assert.equal(requests.length, 1);
+	input.messages.push(h.calls[0].message, { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: true, content: [{ type: "text", text: "Unresolved failure" }], timestamp: 3 });
+	thinking = "high";
+	await h.stream(input).result();
+	assert.equal(h.calls[1].payload.reasoning.effort, "medium", "the request-level effort stays fixed for caching");
+	assert.equal(h.calls[1].payload.input.at(-1).reasoning.effort, "high");
+	assert.equal(requests.length, 2);
+	assert.ok(requests[1].questions.effort);
+	assert.equal(requests[1].model, "typesafe/jev-1.13");
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-effort").at(-1).data.thinking, "high");
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { ...config, skills: true } }));
+	const skill = skillFixture("or-skill");
+	const skillsH = await harness({ openrouterKey: true });
+	await setSkills(skillsH, [skill]);
+	const result = await skillContext(skillsH, [user("Use the skill")]);
+	assert.match(result.messages.at(-1).content, /PRIVATE BODY for or-skill/);
+	assert.equal(requests.length, 3);
+	assert.deepEqual(Object.values(requests[2].questions).map((q) => q.criteria.true.name), ["or-skill"]);
+	assert.equal(requests[2].model, "typesafe/jev-1.13");
+});
+
+test("evaluationProvider accepts only explicit provider names and defaults to the Gateway", () => {
+	const base = { options: { [FAST]: { description: "Routine" } }, fallback: FAST };
+	assert.equal(parseConfig(base).evaluationProvider, "vercel-ai-gateway");
+	assert.equal(parseConfig({ ...base, evaluationProvider: "openrouter" }).evaluationProvider, "openrouter");
+	assert.equal(parseConfig({ ...base, evaluationProvider: "vercel-ai-gateway" }).evaluationProvider, "vercel-ai-gateway");
+	for (const evaluationProvider of ["auto", "gateway", "", 1, null, {}, ["openrouter"], true]) {
+		assert.throws(() => parseConfig({ ...base, evaluationProvider }), /evaluationProvider/);
+	}
+});
+
+test("/jev diagnostics name the selected evaluator and its missing credentials", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" } }, fallback: FAST, evaluationProvider: "openrouter",
+	} }));
+	const configured = await harness({ openrouterKey: true });
+	await configured.commands.get("jev").handler("", configured.ctx);
+	assert.match(configured.notices.at(-1)[0], /Evaluator: openrouter \(configured\)/);
+	const missing = await harness({ openrouterKey: false });
+	await missing.commands.get("jev").handler("", missing.ctx);
+	assert.match(missing.notices.at(-1)[0], /Evaluator: openrouter \(missing: \/login openrouter or OPENROUTER_API_KEY\)/);
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" } }, fallback: FAST,
+	} }));
+	const gateway = await harness();
+	await gateway.commands.get("jev").handler("", gateway.ctx);
+	assert.match(gateway.notices.at(-1)[0], /Evaluator: vercel-ai-gateway \(configured\)/);
 });
