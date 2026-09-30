@@ -29,6 +29,7 @@ after(() => {
 });
 const FAST = "openai-codex/gpt-5.6-luna";
 const DEEP = "openai-codex/gpt-6-astra";
+const OTHER = "anthropic/claude-sonnet-4";
 const usage = { input: 100, output: 10, cacheRead: 50, cacheWrite: 0, totalTokens: 160, cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 0, total: 6 } };
 const user = (text, timestamp = 1) => ({ role: "user", content: text, timestamp });
 const context = (text = "Fix a typo", timestamp = 1) => ({ systemPrompt: "PRIVATE SYSTEM INSTRUCTIONS", tools: [], messages: [user(text, timestamp)] });
@@ -39,7 +40,7 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 	const calls = [], entries = structuredClone(history), notices = [];
 	const models = refs.map((ref) => ({
 		provider: ref.split("/")[0], id: ref.slice(ref.indexOf("/") + 1), name: ref,
-		api: "openai-codex-responses", baseUrl: "https://example.invalid",
+		api: ref.startsWith("anthropic/") ? "anthropic-messages" : "openai-codex-responses", baseUrl: "https://example.invalid",
 		contextWindow: 272000, maxTokens: 128000, input: ["text", "image"], reasoning: true,
 		thinkingLevelMap: { xhigh: "xhigh", max: "max" }, cost: usage.cost,
 	}));
@@ -132,7 +133,9 @@ function mockGateway(t, respond = () => FAST) {
 		const desired = typeof result === "string" ? { target: result } : result;
 		const choice = Object.entries(body.questions.route.criteria).find(([, profile]) =>
 			profile.model === desired.target && (desired.thinking === undefined || profile.thinking === desired.thinking))?.[0] ?? "unoffered-profile";
-		return Response.json({ answers: { route: { type: "choice", choice } }, usage: { inputTokens: 1000, outputTokens: 0 } });
+		const answers = { route: { type: "choice", choice } };
+		if (body.questions.poorFit) answers.poorFit = { type: "boolean", probability: desired.poorFitProbability ?? 0.95 };
+		return Response.json({ answers, usage: { inputTokens: 1000, outputTokens: 0 } });
 	};
 	t.after(() => { globalThis.fetch = previous; });
 	return requests;
@@ -461,8 +464,8 @@ test("adaptive Astra effort changes on tool continuations, preserving the initia
 	assert.deepEqual(high.input.slice(0, initial.input.length), initial.input);
 	assert.deepEqual(high.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
 	assert.deepEqual(Object.keys(requests[1].questions.effort.criteria), ["medium", "high", "xhigh", "max"]);
-	assert.equal(requests[1].state.recent.at(-1).isError, true);
-	assert.equal(requests[1].state.recent.at(-1).text, "Unresolved failure");
+	assert.equal(requests[1].state.failures[0].isError, true);
+	assert.equal(requests[1].state.failures[0].excerpt, "Unresolved failure");
 	const historicalAuxiliary = await harness({ refs: [DEEP], responsesPayload: true, history: h.entries });
 	await historicalAuxiliary.stream(context("Fix the failure"), { sessionId: "compaction" }).result();
 	assert.equal(historicalAuxiliary.calls[0].payload.input.at(-1).reasoning.effort, "high", "auxiliary calls use current effort, even when their context matches an earlier decision");
@@ -541,6 +544,75 @@ test("adaptive effort failure and invalid choices retain current effort without 
 	assert.equal(h.calls.length, 1);
 });
 
+test("adaptive effort works on non-Astra providers through Pi reasoning options", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [OTHER]: { description: "General reasoning", thinking: "auto", adaptiveThinking: true } }, fallback: OTHER, monitor: false,
+	} }));
+	const requests = mockGateway(t, (_options, body) => body.questions.effort ? "high" : { target: OTHER, thinking: "low" });
+	const h = await harness({ refs: [OTHER] });
+	const input = context("Investigate this multi-step issue");
+	await h.stream(input).result();
+	assert.equal(h.calls[0].model.api, "anthropic-messages");
+	assert.equal(h.calls[0].options.reasoning, "low");
+	input.messages.push(h.calls[0].message, { role: "toolResult", toolCallId: "call-1", toolName: "read", isError: true, content: [{ type: "text", text: "The next step needs more reasoning" }], timestamp: 3 });
+	await h.stream(input).result();
+	assert.equal(h.calls[1].model.provider, "anthropic");
+	assert.equal(h.calls[1].options.reasoning, "high");
+	assert.equal(requests.length, 2, "one route choice and one adaptive-effort choice");
+	assert.ok(requests[1].questions.effort.criteria.low);
+	assert.ok(requests[1].questions.effort.criteria.high);
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-effort").at(-1).data.thinking, "high");
+});
+
+test("model suggestions require confident poor-fit evidence and react once to new tool failures", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[FAST]: { description: "Routine changes", thinking: "auto" },
+		[DEEP]: { description: "Deep reasoning", thinking: "auto" },
+	}, fallback: FAST } }));
+	let phase = "initial";
+	const requests = mockGateway(t, () => phase === "initial" ? FAST : {
+		target: DEEP, thinking: "xhigh", poorFitProbability: phase === "weak" ? 0.84 : 0.95,
+	});
+	const h = await harness();
+	const input = context("Diagnose why the change fails");
+	await h.stream(input).result();
+	input.messages.push(
+		{ role: "assistant", content: [{ type: "thinking", thinking: "PRIVATE REASONING" }, { type: "toolCall", id: "private", name: "bash", arguments: { command: "PRIVATE TOOL ARGUMENT" } }], timestamp: 2 },
+		{ role: "toolResult", toolCallId: "private", toolName: "bash", isError: true, content: [{ type: "text", text: `Authorization: Bearer ghp_01...ests failed once; api_key=api-value; OPENAI_API_KEY=openai-value; client_secret=client-value; https://u1:p1@h; postgres://u2:p2@h; mongodb+srv://u3:p3@h; redis://u4:p4@h; ssh://u5:p5@h; ftp://u6:p6@h; AWS_SECRET_ACCESS_KEY=aws-value; ASIA1234567890ABCDEF; sentry_01234567890123456789; rnd_01234567890123456789` }], timestamp: 3 },
+	);
+	phase = "weak";
+	assert.equal((await h.stream(input).result()).model, "gpt-5.6-luna");
+	assert.equal(requests.length, 2, "a new tool failure triggers monitoring during the same user task");
+	assert.ok(requests[1].questions.poorFit);
+	assert.equal(requests[1].state.failures.length, 1);
+	assert.match(requests[1].state.failures[0].excerpt, /redacted/i);
+	assert.ok(requests[1].state.failures[0].excerpt.length <= 512, "failed-tool excerpts are bounded");
+	assert.doesNotMatch(requests[1].state.failures[0].excerpt, /excerpt omitted/i, "credential fixtures fit without truncation");
+	assert.doesNotMatch(JSON.stringify(requests[1]), /ghp_|api-value|openai-value|client-value|u[1-6]:p[1-6]|aws-value|ASIA1234567890ABCDEF|sentry_|rnd_|PRIVATE TOOL ARGUMENT|PRIVATE REASONING/);
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-suggestion").length, 0, "one failure and sub-threshold confidence are insufficient");
+	await h.stream(input).result();
+	assert.equal(requests.length, 2, "the same failure evidence is evaluated only once");
+
+	phase = "strong";
+	input.messages.push(h.calls[1].message, { role: "toolResult", toolCallId: "call-2", toolName: "bash", isError: true, content: [{ type: "text", text: "The same unresolved test failure happened again" }], timestamp: 4 });
+	for (const timestamp of [5, 6, 7]) {
+		const text = timestamp === 7 ? `api_key=last-private-value; ${"x".repeat(900)}` : `Repeated tool failure ${timestamp}`;
+		input.messages.push({ role: "toolResult", toolCallId: `call-${timestamp}`, toolName: "bash", isError: true, content: [{ type: "text", text }], timestamp });
+	}
+	assert.equal((await h.stream(input).result()).model, "gpt-5.6-luna");
+	assert.equal(requests.length, 3);
+	assert.equal(requests[2].state.failures.length, 4, "only the four most recent failures are included");
+	assert.equal(requests[2].state.failures[0].excerpt, "The same unresolved test failure happened again");
+	assert.equal(requests[2].state.failures.at(-1).excerpt.length, 512);
+	assert.match(requests[2].state.failures.at(-1).excerpt, /excerpt omitted/i);
+	assert.doesNotMatch(JSON.stringify(requests[2].state.failures), /last-private-value/);
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-suggestion").length, 1);
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-pin").length, 1, "even a confident suggestion never switches the pinned model");
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.target, FAST);
+});
+
 test("adaptive effort cancellation saves no decision and timeout keeps the existing effort", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { timeoutMs: 20, options: { [DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true } }, fallback: DEEP } }));
@@ -578,12 +650,19 @@ test("effort payload preserves headers/settings, rejects incompatible modes, and
 	assert.equal(down.payload.input.filter((item) => item.type === "configuration_update").length, 1, "same-boundary changes cannot produce adjacent updates");
 	assert.equal(down.payload.input.at(-1).reasoning.effort, "medium");
 	assert.equal(effortPayload(body, [], "minimal", "medium", { minimal: "low" }).payload.input.at(-1).reasoning.effort, "low");
+	assert.equal(effortPayload(body, [], "off", "off").payload.reasoning.effort, "none", "Astra uses the Responses API name for disabled reasoning");
+	const disabled = effortPayload(body, [{ thinking: "high", update: high.update }], "off", "medium");
+	assert.deepEqual(disabled.payload.input.at(-1), { type: "configuration_update", reasoning: { effort: "none" } }, "lowering to off uses the API's none value");
 	for (const extra of [{ truncation: "auto" }, { context_management: [] }, { input: [{ type: "configuration_update" }] }]) {
 		assert.throws(() => effortPayload({ ...body, ...extra }, [], "high", "medium"), /Astra/);
 	}
 	assert.throws(() => effortPayload({}, [], "high", "medium"), /Responses/);
 	for (const adaptiveThinking of [null, "true", 1]) assert.throws(() => parseConfig({ options: { [DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking } }, fallback: DEEP }), /adaptiveThinking/);
-	for (const [target, thinking] of [[FAST, "auto"], [DEEP, "high"], [DEEP, undefined]]) {
+	const autoAdaptive = parseConfig({ options: { [OTHER]: { description: "Task", thinking: "auto", adaptiveThinking: true } }, fallback: OTHER });
+	assert.equal(autoAdaptive.options[OTHER].adaptiveThinking, true, "automatic thinking enables adaptive effort for any provider");
+	const customAdaptive = parseConfig({ options: { [FAST]: { description: "Task", thinking: { low: "Routine", high: "Difficult" }, adaptiveThinking: true } }, fallback: FAST });
+	assert.equal(customAdaptive.options[FAST].adaptiveThinking, true, "custom supported effort choices remain valid");
+	for (const [target, thinking] of [[FAST, "high"], [DEEP, undefined]]) {
 		assert.throws(() => parseConfig({ options: { [target]: { description: "Task", thinking, adaptiveThinking: true } }, fallback: target }), /adaptiveThinking/);
 	}
 });
@@ -1004,6 +1083,8 @@ test("chunked choices respect effort policies and monitoring never replaces the 
 	await h.stream(context("y".repeat(40000), 2)).result();
 	assert.equal(h.calls[1].model.id, "gpt-5.6-luna");
 	assert.equal(h.calls[1].options.reasoning, "low");
+	assert.ok(requests.filter((request) => request.state.stage === "chunk").every((request) => !request.questions.poorFit), "chunks only assess routing");
+	assert.ok(requests.at(-1).questions.poorFit, "the combined monitoring decision assesses model fit once");
 	assert.equal(h.entries.filter((entry) => entry.name === "jev-pin").length, 1);
 	assert.equal(h.entries.filter((entry) => entry.name === "jev-suggestion").length, 1);
 	assert.match(requests.at(-1).questions.route.instructions, /Prefer keeping it/);

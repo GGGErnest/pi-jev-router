@@ -10,7 +10,7 @@
   <a href="https://pi.dev"><img src="https://img.shields.io/badge/Pi-0.85.1%2B-f8b86d?style=flat-square" alt="Pi 0.85.1 or later"></a>
 </p>
 
-Let [TypeSafe's Jev](https://vercel.com/ai-gateway/models/jev) choose a model and reasoning effort for [Pi](https://pi.dev). The model stays fixed for the session. Effort stays fixed too, unless you enable adaptive effort for Codex Astra. Generation uses your existing Pi providers and credentials.
+Let [TypeSafe's Jev](https://vercel.com/ai-gateway/models/jev) choose a model and reasoning effort for [Pi](https://pi.dev). The model stays pinned for the session; opt-in adaptive effort can adjust its supported thinking level without switching models. Generation uses your existing Pi providers and credentials.
 
 ## Get started
 
@@ -74,9 +74,9 @@ Set `jevRouter.minThinking` for a global floor, and `minThinking` inside a model
 
 Automatic and custom choices below the floor are excluded. Fixed or inherited effort below the floor is raised to the lowest supported level meeting it. Routes with no eligible level are excluded, including non-reasoning models when the floor is above `off`; fallback errors if it has no eligible choice. `/jev` shows configured minimums. Reload after editing; existing session pins keep their original effort.
 
-### Adaptive Astra effort (opt-in)
+### Adaptive effort (opt-in)
 
-Set `"adaptiveThinking": true` inside the `openai-codex/gpt-6-astra` option, alongside `"thinking": "auto"` or custom thinking choices. Other models and fixed/inherited effort policies do not accept this flag.
+Set `"adaptiveThinking": true` on any route that uses `"thinking": "auto"` or custom thinking choices. Fixed or inherited thinking cannot adapt.
 
 ```json
 "openai-codex/gpt-6-astra": {
@@ -86,16 +86,17 @@ Set `"adaptiveThinking": true` inside the `openai-codex/gpt-6-astra` option, alo
 }
 ```
 
-After the initial route, Jev assesses the next step before each main model request, including tool continuations. It can raise effort for unresolved failures or difficult decisions and lower it for routine work. It chooses only supported levels allowed by your choices and minimums. This is a heuristic, not a guarantee that Jev detects every stall. Changes take effect between responses, never inside a running response.
+After the initial route, Jev checks each distinct main-request context, including tool continuations. It can raise effort for a harder next step and lower it after the hard reasoning is resolved, using only levels supported by that model and allowed by your choices/minimums. It never changes the model. When evidence is unclear or Jev fails, it keeps the current effort. This is a heuristic, not a guarantee that Jev detects every stall. Changes take effect between responses, never inside a running response.
 
-- **Keep the model and request prefix.** The original request-level effort stays fixed. Changes use Astra's append-only `configuration_update` items, replayed at their original input positions. This follows [OpenAI's cache-preserving mechanism](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation); normal cache requirements still apply. Do not use provider-side automatic compaction, automatic truncation, or another hook that inserts configuration updates.
-- **Persist and recover.** Decisions follow the active branch across reload/resume. If local Pi compaction or edited history invalidates an update's original prefix, the current effort is re-established on the rebuilt input. Forks choose afresh. Auxiliary requests reuse effort without evaluating or saving changes.
-- **Bound overhead.** At most one additional evaluation per distinct request context, bounded by `timeoutMs`, with no retries and a 28,000-byte request budget. Failure retains current effort; cancellation stops the request. `monitor: false` disables model-switch suggestions, not adaptive effort.
+- **Generic providers.** The selected effort is passed to the provider through Pi's per-request `reasoning` option. The model's Pi metadata determines its supported levels.
+- **Codex Astra cache handling.** The original request-level effort stays fixed. Changes use Astra's append-only `configuration_update` items, replayed at their original input positions, following [OpenAI's cache-preserving mechanism](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation). Do not use provider-side automatic compaction, automatic truncation, or another hook that inserts configuration updates.
+- **Persist and recover.** Decisions follow the active branch across reload/resume. Astra updates are re-established after local compaction or edited history invalidates their prefix. Generic providers reuse the saved effort on each request. Forks choose afresh; auxiliary requests reuse effort without evaluating or saving changes.
+- **Bound overhead.** Adaptive effort adds at most one no-retry evaluation per distinct request context, bounded by `timeoutMs` and a 28,000-byte request budget. Model monitoring is separate and follows routing's retry/chunk limits; it runs only for new user text or new failed-tool evidence. A failed effort check keeps the current level; cancellation stops the request. `monitor: false` disables model suggestions, not adaptive effort.
 - **See changes.** Notifications, the status line, and `/jev` show current effort. `/jev` also shows the initial effort used at request level. Pi's thinking picker still does not control or track the router's effort.
 
-Reload after changing the flag. Enabling it can adapt an existing Astra pin on its next request. Disabling it stops new decisions but preserves and replays prior updates; use a new session for a fresh pin.
+Reload after changing the flag. Enabling it can adapt an existing pin on its next request. Disabling it stops new decisions but preserves saved effort; use a new session for a fresh pin.
 
-**Additional data and cost:** effort checks send the latest user-text excerpt plus up to eight recent user, assistant, and tool-result excerpts to Vercel/TypeSafe. Each excerpt keeps up to 1,600 characters, split between its beginning and end. Tool names and error flags are included; tool-call arguments, reasoning blocks, images, and system messages are excluded. Tool-result text can contain secrets and is not redacted. These evaluations are billed separately and are not included in `/jev` routing-cost estimates.
+**Additional data and cost:** opt-in effort checks send the latest user task, up to eight recent user/assistant text excerpts, tool names, and at most four failed-tool excerpts capped at 512 characters each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Successful tool output, tool-call arguments, reasoning blocks, images, and system messages are excluded. Evaluations are billed separately and are not included in `/jev` routing-cost estimates.
 
 ### Automatic skill loading (opt-in)
 
@@ -121,16 +122,16 @@ Tasks over **192,000 UTF-8 bytes**, excessive chunk plans, or incomplete evaluat
 
 ## Session behavior
 
-- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless adaptive Astra effort is enabled. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
-- **Suggest, never switch.** Monitoring checks new user text and may suggest a fork with another model, once per alternative per session. Use `/fork`, then `/model` and `/thinking` in the fork to follow it. No automatic forks or model switches.
-- **Control overhead.** Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. Set `"monitor": false` to disable model-switch advisory checks; tool continuations don't trigger those checks. Adaptive effort has its own per-request check described above.
+- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless `adaptiveThinking` is enabled for that route. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
+- **Suggest, never switch.** Monitoring checks new user text; new failed-tool results trigger a check during an active user task with routing text. A different model is suggested only when Jev's poor-fit probability reaches **0.85**; this probability is a heuristic, not calibrated confidence. A hard task or single tool error alone is insufficient. The session remains pinned. Use `/fork`, then `/model` and `/thinking` in the fork to follow a suggestion. No automatic forks or model switches.
+- **Control overhead.** Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. `monitor: false` disables model-switch advisory checks; a new failed tool result can trigger monitoring during an ongoing task, but successful tool continuations do not. Adaptive effort has its own per-request check described above.
 - **Fail explicitly.** Initial routing failures use the fallback, with its fixed/inherited effort or highest supported automatic choice. If an existing pin becomes unavailable or cannot accept the input, the router errors instead of switching.
 
 Context limits follow the pinned backend. The status and `/jev` show its current effort; Pi's thinking picker does not track automatic choices. Selecting a concrete model bypasses model routing, but not opt-in skill selection. Deferred/background generation is unsupported by `auto/jev`.
 
 ## Privacy and cost
 
-Routing and monitoring consider up to **eight recent user/assistant text messages**, limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to Vercel/TypeSafe. Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, tool-result blocks, images, and provider credentials are excluded from model-routing evaluations. Opt-in adaptive effort additionally sends tool-result excerpts as described above. **Conversation text is not redacted and may contain secrets.**
+Routing and monitoring consider up to **eight recent user/assistant text messages**, limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to Vercel/TypeSafe. Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, images, tool arguments, and successful tool output are excluded. When monitoring sees new failed-tool evidence during an active task with routing text, it additionally sends up to **four** tool names, error flags, and excerpts capped at **512 characters** each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Adaptive effort can send the same bounded failure evidence when enabled. **Conversation text is not redacted and may contain sensitive information.**
 
 Opt-in skill selection additionally sends eligible skill names and descriptions to Vercel/TypeSafe. Skill file contents are read locally and stored in the session; automatically injected skill messages are excluded from subsequent Jev evaluations. Manually pasted or expanded skill instructions in user messages remain conversation text.
 
