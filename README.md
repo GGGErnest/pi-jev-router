@@ -48,7 +48,9 @@ Merge `jevRouter` into **global** `~/.pi/agent/settings.json`, then `/reload`:
     "fallback": "openai-codex/gpt-6-astra",
     "timeoutMs": 5000,
     "monitor": true,
-    "skills": false
+    "skills": false,
+    "pinFallback": false,
+    "evidence": "recent"
   }
 }
 ```
@@ -60,6 +62,8 @@ The virtual `auto/jev` model advertises the largest available configured route w
 `jevRouter.evaluationProvider` selects where Jev evaluations run: `"vercel-ai-gateway"` (default) or `"openrouter"`. It is chosen **only** from this setting — the extension never auto-detects or falls back to the other provider. A missing key for the selected provider fails closed with guidance naming its `/login` command and environment variable (`AI_GATEWAY_API_KEY` or `OPENROUTER_API_KEY`). Credentials always come from Pi's registry, never from `settings.json`.
 
 Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.
+
+Optional tuning knobs (defaults shown): `evidence` is `"recent"` (up to eight recent user/assistant messages) or `"latest"` (only the newest user message); `pinFallback` is `false`, so a fallback chosen after an evaluation failure is provisional and re-routed on the next request, while `true` locks it for the session; `poorFitThreshold` is `0.85` and `skillProbability` is `0.8` (each `0`–`1`); `maxSkills` is `3`; `debug` is `false` and adds a safe failure label to warnings without exposing SDK error bodies; and `evaluationCost` sets the `inputPerMillion` (default `0.042`) and `outputPerMillion` (default `0`) rates used for the `/jev` estimate. Invalid values fail at load.
 
 Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
 
@@ -128,20 +132,20 @@ Tasks over **192,000 UTF-8 bytes**, excessive chunk plans, or incomplete evaluat
 
 ## Session behavior
 
-- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless `adaptiveThinking` is enabled for that route. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
+- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless `adaptiveThinking` is enabled for that route. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins. Manage the current session pin manually with `/jev reset` (clear it and re-route next request) or `/jev pin <provider/model> [thinking]` (set it explicitly).
 - **Suggest, never switch.** Monitoring checks new user text; new failed-tool results trigger a check during an active user task with routing text. A different model is suggested only when Jev's poor-fit probability reaches **0.85**; this probability is a heuristic, not calibrated confidence. A hard task or single tool error alone is insufficient. The session remains pinned. Use `/fork`, then `/model` and `/thinking` in the fork to follow a suggestion. No automatic forks or model switches.
-- **Control overhead.** Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. `monitor: false` disables model-switch advisory checks; a new failed tool result can trigger monitoring during an ongoing task, but successful tool continuations do not. Adaptive effort has its own per-request check described above.
-- **Fail explicitly.** Initial routing failures use the fallback, with its fixed/inherited effort or highest supported automatic choice. If an existing pin becomes unavailable or cannot accept the input, the router errors instead of switching.
+- **Control overhead.** Routing and model-monitor evaluations retry up to three attempts of `timeoutMs` each (1 to 60,000 ms), including transient HTTP 408/425/429/5xx responses, with bounded backoff and jitter. The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. `monitor: false` disables model-switch advisory checks; a new failed tool result can trigger monitoring during an ongoing task, but successful tool continuations do not. Adaptive effort has its own per-request check described above.
+- **Fail explicitly, without pinning a bad fallback.** Initial routing failures use the fallback, with its fixed/inherited effort or highest supported automatic choice. Unless `pinFallback` is `true`, that fallback is a *provisional* pin: requests keep flowing, but each new main request re-routes until Jev returns a real decision, at which point the provisional pin is upgraded. If an existing pin becomes unavailable or cannot accept the input, the router errors instead of switching.
 
 Context limits follow the pinned backend. The status and `/jev` show its current effort; Pi's thinking picker does not track automatic choices. Selecting a concrete model bypasses model routing, but not opt-in skill selection. Deferred/background generation is unsupported by `auto/jev`.
 
 ## Privacy and cost
 
-Routing and monitoring consider up to **eight recent user/assistant text messages**, limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to the configured evaluator (`vercel-ai-gateway` serves Vercel/TypeSafe; `openrouter` sends them to OpenRouter's Decisions API). Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, images, tool arguments, and successful tool output are excluded. When monitoring sees new failed-tool evidence during an active task with routing text, it additionally sends up to **four** tool names, error flags, and excerpts capped at **512 characters** each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Adaptive effort can send the same bounded failure evidence when enabled. **Conversation text is not redacted and may contain sensitive information.**
+Routing and monitoring consider up to **eight recent user/assistant text messages** (or only the newest user message when `evidence` is `"latest"`), limited to **192,000 UTF-8 bytes of source text**. Evaluations send selected text, route/effort descriptions, and chunk assessments to the configured evaluator (`vercel-ai-gateway` serves Vercel/TypeSafe; `openrouter` sends them to OpenRouter's Decisions API). Overlaps, excerpts, and retries can send the same text more than once. System prompts, reasoning blocks, images, tool arguments, and successful tool output are excluded. When monitoring sees new failed-tool evidence during an active task with routing text, it additionally sends up to **four** tool names, error flags, and excerpts capped at **512 characters** each. Common credential patterns are redacted, but redaction is best-effort and may miss secrets or personal data. Adaptive effort can send the same bounded failure evidence when enabled. **Conversation text is not redacted and may contain sensitive information.**
 
 Opt-in skill selection additionally sends eligible skill names and descriptions to the configured evaluator (Vercel/TypeSafe or OpenRouter). Skill file contents are read locally and stored in the session; automatically injected skill messages are excluded from subsequent Jev evaluations. Manually pasted or expanded skill instructions in user messages remain conversation text.
 
-Evaluator requests are billed separately by the configured provider (Vercel AI Gateway or OpenRouter). Chunked routing can require up to **nine evaluation requests** (eight chunks plus a combined decision). Authentication, chunks, retries, and the combined request share a wall-clock ceiling of **3 × `timeoutMs`** (15 seconds by default); the full per-request timeout is not multiplied by the chunk count. `/jev` estimates sum returned usage; failed, cancelled, or timed-out calls may still be billed. Jev 1.13 bills $0.042 per 1M input tokens and its output tokens are free, so the estimate counts only input usage. Skill-selection evaluations are additional and are not included in `/jev` routing estimates. Evaluation costs are not in Pi's footer totals. Pinning favors cache reuse but guarantees neither cache hits nor savings.
+Evaluator requests are billed separately by the configured provider (Vercel AI Gateway or OpenRouter). Chunked routing can require up to **nine evaluation requests** (eight chunks plus a combined decision). Authentication, chunks, retries, and the combined request share a wall-clock ceiling of **3 × `timeoutMs`** (15 seconds by default); the full per-request timeout is not multiplied by the chunk count. `/jev` estimates sum returned usage; failed, cancelled, or timed-out calls may still be billed. By default the estimate counts only input usage at Jev 1.13's $0.042 per 1M input tokens (output is free); override the rates with `evaluationCost.inputPerMillion` and `evaluationCost.outputPerMillion`. Skill-selection evaluations are additional and are not included in `/jev` routing estimates. Evaluation costs are not in Pi's footer totals. Pinning favors cache reuse but guarantees neither cache hits nor savings.
 
 <details>
 <summary>Migrating from file-based configuration</summary>
@@ -158,6 +162,8 @@ nub run test
 ```
 
 Tests mock network responses; no API keys or paid requests are needed.
+
+The extension entry point is `index.ts` (Pi's wiring and the `auto/jev` provider). Pure logic lives in `src/`: `config.ts` (settings and validation), `effort.ts` (thinking profiles and Astra updates), `evidence.ts` (bounded/redacted request evidence), `evaluator.ts` (provider setup and retry classification), `skills.ts`, and shared `util.ts`/`errors.ts`.
 
 ## Publishing
 

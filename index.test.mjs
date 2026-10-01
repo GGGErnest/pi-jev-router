@@ -1058,7 +1058,7 @@ test("failed or cancelled monitoring never suggests a fallback or drops the exis
 	assert.doesNotMatch(JSON.stringify(h.entries), /PRIVATE MONITOR BODY/);
 	const resumed = await harness({ history: h.entries });
 	await resumed.stream(context("Harder task", 3)).result();
-	assert.equal(requests.length, 2, "reload must not repeat a completed check for the same message");
+	assert.equal(requests.length, 4, "a 503 monitor is retried, then reload must not repeat a completed check for the same message");
 	mode = "hanging";
 	const controller = new AbortController();
 	const pending = h.stream(context("Another task", 4), { signal: controller.signal }).result();
@@ -1089,17 +1089,20 @@ test("only allowlisted available models are offered; Gateway failures never invo
 	const h = await harness();
 	const result = await h.stream().result();
 	assert.equal(result.model, "gpt-6-astra");
-	assert.equal(requests.length, 1, "no SDK retry delays");
+	assert.equal(requests.length, 3, "transient 503s are retried up to the attempt limit");
 	assert.equal(h.calls[0].options.reasoning, "xhigh");
 	assert.equal(h.entries[0].data.source, "fallback");
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.provisional, true, "a fallback route is provisional by default");
 	assert.doesNotMatch(JSON.stringify(h.notices), /PRIVATE SERVER BODY/);
+	// A failed first route leaves a provisional pin, so the next request re-routes instead of
+	// locking the session onto the fallback.
 	await h.stream().result();
-	assert.equal(requests.length, 1, "fallback is also pinned");
+	assert.equal(requests.length, 6, "a provisional fallback re-routes on the next request");
 
 	const single = await harness({ refs: [FAST] });
 	await single.stream().result();
 	assert.equal(single.calls[0].model.id, "gpt-5.6-luna");
-	assert.equal(requests.length, 1, "one candidate needs no evaluator");
+	assert.equal(requests.length, 6, "one candidate needs no evaluator");
 	const none = await harness({ refs: [] });
 	assert.equal((await none.stream().result()).stopReason, "error");
 	assert.equal(none.calls.length, 0);
@@ -1267,7 +1270,7 @@ test("a failed chunk cancels its sibling and never combines a partial result", a
 	});
 	const h = await harness();
 	assert.equal((await h.stream(context("x".repeat(80000))).result()).model, "gpt-6-astra");
-	assert.equal(requests.length, 2);
+	assert.equal(requests.length, 4, "the failed chunk retries twice before cancelling its sibling");
 	assert.equal(siblingAborted, true);
 	assert.equal(h.entries[0].data.source, "fallback");
 	assert.equal(h.entries[0].data.usageIncomplete, true);
@@ -1355,7 +1358,7 @@ test("evaluation retries twice after timeouts before succeeding", async (t) => {
 	const originalTimeout = AbortSignal.timeout;
 	t.mock.method(AbortSignal, "timeout", (ms) => {
 		assert.ok(ms === 5000 || ms === 15000);
-		return originalTimeout(ms === 5000 ? 10 : 1000);
+		return originalTimeout(ms === 5000 ? 10 : 3000);
 	});
 	let attempts = 0;
 	const requests = mockGateway(t, (options) => ++attempts < 3 ? delay(1000, FAST, { signal: options.signal }) : FAST);
@@ -1369,7 +1372,7 @@ test("evaluation timeouts fall back, while authentication failures expose only t
 	const originalTimeout = AbortSignal.timeout;
 	t.mock.method(AbortSignal, "timeout", (ms) => {
 		assert.ok(ms === 5000 || ms === 15000);
-		return originalTimeout(ms === 5000 ? 10 : 1000);
+		return originalTimeout(ms === 5000 ? 10 : 3000);
 	});
 	let rejectAuth = false;
 	mockGateway(t, (options) => rejectAuth ? Response.json({ error: "SECRET ERROR BODY" }, { status: 401 }) : delay(1000, FAST, { signal: options.signal }));
@@ -1635,4 +1638,121 @@ test("corrupt saved effort entries never break status updates or session start",
 	h.ctx.ui.setStatus = (_key, value) => { status = value; };
 	await h.handlers.get("session_tree")({}, h.ctx);
 	assert.match(status, /low, pinned/);
+});
+
+test("transient 429 and 5xx responses are retried before falling back", async (t) => {
+	let attempt = 0;
+	const requests = mockGateway(t, () => ++attempt === 1 ? Response.json({ error: "busy" }, { status: 429 }) : FAST);
+	const h = await harness();
+	assert.equal((await h.stream().result()).model, "gpt-5.6-luna");
+	assert.equal(requests.length, 2, "a 429 is retried once before succeeding");
+	assert.equal(h.entries[0].data.source, "jev");
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.provisional, undefined);
+});
+
+test("pinFallback locks the fallback for the session when enabled", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Deep" } }, fallback: DEEP, pinFallback: true, monitor: false,
+	} }));
+	const requests = mockGateway(t, () => Response.json({ error: "busy" }, { status: 503 }));
+	const h = await harness();
+	await h.stream().result();
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.provisional, undefined, "pinFallback persists a real pin");
+	assert.equal(requests.length, 3);
+	await h.stream(context("Next", 2)).result();
+	assert.equal(requests.length, 3, "the fallback pin is not re-routed");
+});
+
+test("/jev reset clears the pin and /jev pin sets one manually", async (t) => {
+	const requests = mockGateway(t);
+	const h = await harness();
+	await h.stream().result();
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-pin").length, 1);
+	await h.commands.get("jev").handler("reset", h.ctx);
+	assert.match(h.notices.at(-1)[0], /cleared the session pin/);
+	const reloaded = await harness({ history: h.entries });
+	assert.equal(reloaded.entries.filter((entry) => entry.name === "jev-pin").length, 1);
+	await reloaded.stream(context("Fresh", 5)).result();
+	assert.ok(reloaded.entries.some((entry) => entry.name === "jev-route" && entry.data.source === "jev"), "a reset pin re-routes");
+	await reloaded.commands.get("jev").handler("pin openai-codex/gpt-6-astra xhigh", reloaded.ctx);
+	assert.match(reloaded.notices.at(-1)[0], /pinned openai-codex\/gpt-6-astra at xhigh/);
+	assert.equal((await reloaded.stream(context("Pinned", 6)).result()).model, "gpt-6-astra");
+	await reloaded.commands.get("jev").handler("pin openai-codex/gpt-5.6-luna xhigh", reloaded.ctx);
+	assert.match(reloaded.notices.at(-1)[0], /does not allow thinking xhigh/);
+	await reloaded.commands.get("jev").handler("bogus", reloaded.ctx);
+	assert.match(reloaded.notices.at(-1)[0], /Usage: \/jev/);
+});
+
+test("validates the effort, privacy, cost, and threshold knobs", () => {
+	const base = { options: { [FAST]: { description: "fast" } }, fallback: FAST };
+	assert.equal(parseConfig(base).evidence, "recent");
+	assert.equal(parseConfig(base).pinFallback, false);
+	assert.equal(parseConfig(base).debug, false);
+	assert.deepEqual(parseConfig(base).evaluationCost, { inputPerMillion: 0.042, outputPerMillion: 0 });
+	for (const evidence of ["all", "", 1, null]) assert.throws(() => parseConfig({ ...base, evidence }));
+	for (const poorFitThreshold of [-0.1, 1.1, "high", NaN]) assert.throws(() => parseConfig({ ...base, poorFitThreshold }));
+	for (const skillProbability of [-1, 2, "0.5"]) assert.throws(() => parseConfig({ ...base, skillProbability }));
+	for (const maxSkills of [0, -1, 1.5, "3"]) assert.throws(() => parseConfig({ ...base, maxSkills }));
+	for (const pinFallback of ["true", 0, null]) assert.throws(() => parseConfig({ ...base, pinFallback }));
+	for (const debug of ["true", 0, null]) assert.throws(() => parseConfig({ ...base, debug }));
+	for (const evaluationCost of [null, [], 1, { inputPerMillion: -1 }, { outputPerMillion: "0" }]) assert.throws(() => parseConfig({ ...base, evaluationCost }));
+	const configured = parseConfig({ ...base, evidence: "latest", poorFitThreshold: 0.5, skillProbability: 0.9, maxSkills: 5, pinFallback: true, debug: true, evaluationCost: { inputPerMillion: 1, outputPerMillion: 2 } });
+	assert.equal(configured.evidence, "latest");
+	assert.equal(configured.poorFitThreshold, 0.5);
+	assert.equal(configured.maxSkills, 5);
+	assert.equal(configured.pinFallback, true);
+	assert.equal(configured.debug, true);
+	assert.deepEqual(configured.evaluationCost, { inputPerMillion: 1, outputPerMillion: 2 });
+});
+
+test("evidence: latest sends only the newest user message to the evaluator", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Deep" } }, fallback: DEEP, evidence: "latest",
+	} }));
+	const requests = mockGateway(t);
+	const h = await harness();
+	const input = context("Latest only");
+	input.messages.unshift(user("Earlier private context", 0));
+	await h.stream(input).result();
+	assert.deepEqual(requests[0].state.messages, [{ role: "user", text: "Latest only" }]);
+});
+
+test("debug surfaces a safe evaluation failure label without error bodies", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Deep" } }, fallback: DEEP, debug: true,
+	} }));
+	mockGateway(t, () => Response.json({ error: "PRIVATE BODY" }, { status: 503 }));
+	const h = await harness();
+	await h.stream().result();
+	assert.match(h.entries[0].data.reason, /\[HTTP 503\]/);
+	assert.doesNotMatch(JSON.stringify(h.entries) + JSON.stringify(h.notices), /PRIVATE BODY/);
+});
+
+test("estimated Jev cost honors configured input and output rates", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Deep" } }, fallback: DEEP,
+		evaluationCost: { inputPerMillion: 1, outputPerMillion: 2 },
+	} }));
+	mockGateway(t);
+	const h = await harness();
+	await h.stream().result();
+	// The mock returns inputTokens: 1000, outputTokens: 0.
+	assert.equal(h.entries[0].data.estimatedCost, 1000 * 1 / 1_000_000);
+});
+
+test("skillProbability and maxSkills bound automatic skill loading", async (t) => {
+	configureSkills(t, { skillProbability: 0.96, maxSkills: 1 });
+	const requests = mockSkillGateway(t, { "skill-a": 0.95, "skill-b": 0.99 });
+	const h = await harness();
+	await setSkills(h, [skillFixture("skill-a"), skillFixture("skill-b")]);
+	const result = await skillContext(h, [user("Use the skills")]);
+	const injected = result.messages.filter((message) => message.customType === "jev-skills");
+	assert.equal(injected.length, 1);
+	assert.match(injected[0].content, /PRIVATE BODY for skill-b/);
+	assert.doesNotMatch(injected[0].content, /PRIVATE BODY for skill-a/);
+	assert.equal(requests.length, 1);
 });

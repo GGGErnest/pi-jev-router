@@ -1,9 +1,7 @@
-import { createHash } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
-	clampThinkingLevel,
 	createAssistantMessageEventStream,
 	getSupportedThinkingLevels,
 	type Api,
@@ -13,413 +11,21 @@ import {
 	type ModelThinkingLevel,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { getAgentDir, stripFrontmatter, type ContextEvent, type ExtensionAPI, type ExtensionContext, type Skill } from "@earendil-works/pi-coding-agent";
-import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { createGateway, experimental_evaluate as evaluate } from "ai";
+import { getAgentDir, stripFrontmatter, type ExtensionAPI, type ExtensionContext, type Skill } from "@earendil-works/pi-coding-agent";
+import { experimental_evaluate as evaluate } from "ai";
 
-const PROVIDER = "auto";
-const MODEL = "jev";
-type EvaluationProvider = "openrouter" | "vercel-ai-gateway";
-// Jev evaluations run through exactly one configured provider. The provider is
-// chosen only from jevRouter.evaluationProvider; a missing key fails closed and
-// is never replaced by the other provider's credentials.
-const EVALUATION_MODEL: Record<EvaluationProvider, string> = {
-	openrouter: "typesafe/jev-1.13",
-	"vercel-ai-gateway": "typesafe-ai/jev",
-};
-const EVALUATION_CREDENTIALS: Record<EvaluationProvider, { login: string; env: string }> = {
-	openrouter: { login: "/login openrouter", env: "OPENROUTER_API_KEY" },
-	"vercel-ai-gateway": { login: "/login vercel-ai-gateway", env: "AI_GATEWAY_API_KEY" },
-};
-const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-const EVALUATION_ATTEMPTS = 3;
-// ponytail: Jev exposes no tokenizer. Count serialized UTF-8 bytes conservatively,
-// leaving room below its documented ~32K-token budget; use its tokenizer if exposed.
-const EVALUATION_BYTES = 28_000;
-const ROUTING_BYTES = 192_000;
-const MAX_CHUNKS = 8;
-const CHUNK_OVERLAP = 128;
-const CHUNK_CONCURRENCY = 2;
-const MAX_ROUTING_FAILURES = 4;
-const MAX_FAILURE_EXCERPT = 512;
-const POOR_FIT_THRESHOLD = 0.85;
-// Keep aligned with Pi's default compaction reserve (16,384 tokens).
-const CONTEXT_RESERVE_TOKENS = 16_384;
-// Codex Astra is the only route whose Responses requests are updated with append-only
-// configuration_update items to preserve prompt-cache reuse, and the only route allowed to
-// lower the global thinking floor through an explicit model minimum. Keep its identity in one
-// place so these behaviors stay consistent if the model reference ever changes.
-const ASTRA_REF = "openai-codex/gpt-6-astra";
-const ASTRA_PROVIDER = "openai-codex";
-const ASTRA_MODEL = "gpt-6-astra";
-// TypeSafe Jev 1.13 bills $0.042 per 1M input tokens; output tokens are free.
-const JEV_INPUT_COST_PER_MILLION = 0.042;
+import {
+	ASTRA_REF, CHUNK_CONCURRENCY, CONTEXT_RESERVE_TOKENS, DEFAULT_CONFIG, EVALUATION_ATTEMPTS, EVALUATION_CREDENTIALS, MODEL, PROVIDER, THINKING_LEVELS, ZERO_COST,
+	confidentPoorFit, parseConfig, type Config, type Pin, type Selection,
+} from "./src/config";
+import { effortPayload, thinkingProfiles, type EffortEntry } from "./src/effort";
+import { fitsEvaluation, chunkRoutingText, routingInput, textOf, toolFailureEvidence } from "./src/evidence";
+import { evaluationModel, retryableEvaluationError, safeErrorLabel } from "./src/evaluator";
+import { EvaluationAuthError, RoutingBudgetError } from "./src/errors";
+import { isLoadedSkill, loadedSkillPaths, skillMessage, skillPath, type LoadedSkill } from "./src/skills";
+import { abortable, contextDigest, digest, isRecord, xmlAttribute } from "./src/util";
 
-class RoutingBudgetError extends Error {}
-class EvaluationAuthError extends Error {}
-
-function fitsEvaluation(state: unknown, questions: unknown) {
-	return Buffer.byteLength(JSON.stringify({ state, questions, providerOptions: {} }), "utf8") <= EVALUATION_BYTES;
-}
-
-const AUTO_THINKING: Record<ModelThinkingLevel, string> = {
-	off: "Mechanical transformations, rote answers, or trivial facts. No deliberation needed.",
-	minimal: "Tiny, obvious changes that need only a quick check.",
-	low: "Straightforward work with clear requirements and few steps.",
-	medium: "Multi-step implementation or debugging with moderate ambiguity.",
-	high: "Difficult debugging, architecture, or security-sensitive work requiring careful validation.",
-	xhigh: "Very complex investigations with many interacting constraints.",
-	max: "Exceptionally difficult problems requiring exhaustive reasoning. Avoid for routine work.",
-};
-
-type ThinkingChoices = Partial<Record<ModelThinkingLevel, string>>;
-type RouteCriteria = { role: string; use_when: string[]; not_for: string[]; boundary: string };
-type RouteOption = { description: string | RouteCriteria; thinking?: ModelThinkingLevel | "auto" | ThinkingChoices; minThinking?: ModelThinkingLevel; adaptiveThinking?: boolean };
-type RouteProfile = { target: string; thinking: ModelThinkingLevel; description: { model: string; task: string | RouteCriteria; thinking?: ModelThinkingLevel; effort: string; keepCurrentModel?: boolean } };
-type Config = { options: Record<string, RouteOption>; fallback: string; timeoutMs: number; monitor: boolean; skills: boolean; evaluationProvider: EvaluationProvider; minThinking?: ModelThinkingLevel };
-const DEFAULT_CONFIG: Config = {
-	options: {
-		"openai-codex/gpt-5.6-luna": {
-			description: "Cheap, fast, capable executor for clear goals and known approaches: bounded implementation, understood fixes, tests, translations, summaries, and routine configuration. Not for architecture, difficult debugging, uncertain root causes, or advisory judgment.",
-			thinking: "max",
-		},
-		"openai-codex/gpt-5.6-sol": {
-			description: "Middle tier for bounded implementation needing investigation, ordinary debugging, local correctness reviews, and integration within established architecture. Not for routine execution Luna can handle, architectural direction, difficult debugging, or high-stakes advice.",
-			thinking: "auto",
-		},
-		[ASTRA_REF]: {
-			description: "Highest-intelligence reasoning and advisor for critical thinking, recommendations, architecture, hard debugging, interacting failure modes, security-critical decisions, and complex ambiguity. Not for mechanical execution, simple summaries, or bounded implementation without substantive judgment.",
-			thinking: "xhigh",
-		},
-	},
-	fallback: ASTRA_REF,
-	timeoutMs: 5000,
-	monitor: true,
-	skills: false,
-	evaluationProvider: "vercel-ai-gateway",
-};
-type Selection = {
-	target: string;
-	thinking: ModelThinkingLevel;
-	source: "jev" | "fallback" | "single" | "guarded";
-	reason?: string;
-	inputTokens?: number;
-	outputTokens?: number;
-	evaluationRequests?: number;
-	routingChunks?: number;
-	usageIncomplete?: boolean;
-};
-
-type Pin = Pick<Selection, "target" | "thinking">;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function confidentPoorFit(value: unknown) {
-	return isRecord(value) && value.type === "boolean" && typeof value.probability === "number" &&
-		Number.isFinite(value.probability) && value.probability >= POOR_FIT_THRESHOLD && value.probability <= 1;
-}
-
-function validDescription(value: unknown): value is string | RouteCriteria {
-	if (typeof value === "string") return value.trim().length > 0;
-	return isRecord(value) && [value.role, value.boundary].every((text) => typeof text === "string" && text.trim().length > 0)
-		&& [value.use_when, value.not_for].every((items) => Array.isArray(items) && items.length > 0 && items.every((text) => typeof text === "string" && text.trim().length > 0));
-}
-
-function parseMinThinking(value: unknown, scope: string): ModelThinkingLevel | undefined {
-	if (value === undefined) return undefined;
-	const level = THINKING_LEVELS.find((level) => level === value);
-	if (!level) throw new Error(`Invalid Jev minThinking for ${scope}.`);
-	return level;
-}
-
-export function parseConfig(value: unknown): Config {
-	if (!isRecord(value) || !isRecord(value.options) || typeof value.fallback !== "string") {
-		throw new Error("Jev configuration requires options and a fallback model.");
-	}
-	const options: Record<string, RouteOption> = {};
-	for (const [ref, option] of Object.entries(value.options)) {
-		if (!/^[^/]+\/.+/.test(ref) || ref.startsWith(`${PROVIDER}/`) ||
-			!isRecord(option) || !validDescription(option.description)) {
-			throw new Error(`Invalid Jev route: ${ref}`);
-		}
-		let thinking: RouteOption["thinking"];
-		if (isRecord(option.thinking)) {
-			const choices: ThinkingChoices = {};
-			for (const [key, description] of Object.entries(option.thinking)) {
-				const level = THINKING_LEVELS.find((level) => level === key);
-				if (!level || typeof description !== "string" || !description.trim()) throw new Error(`Invalid Jev thinking choice for ${ref}: ${key}`);
-				choices[level] = description;
-			}
-			if (!Object.keys(choices).length) throw new Error(`Jev thinking choices for ${ref} must not be empty.`);
-			thinking = choices;
-		} else {
-			thinking = option.thinking === "auto" ? "auto" : THINKING_LEVELS.find((level) => level === option.thinking);
-			if (option.thinking !== undefined && thinking === undefined) throw new Error(`Invalid Jev thinking level for ${ref}.`);
-		}
-		const adaptiveThinking = option.adaptiveThinking === undefined ? false : option.adaptiveThinking;
-		if (typeof adaptiveThinking !== "boolean" || (adaptiveThinking &&
-			(thinking !== "auto" && typeof thinking !== "object"))) {
-			throw new Error(`Jev adaptiveThinking requires automatic or custom thinking choices: ${ref}`);
-		}
-		options[ref] = { description: option.description, thinking, minThinking: parseMinThinking(option.minThinking, ref), adaptiveThinking };
-	}
-	const timeoutMs = value.timeoutMs ?? 5000;
-	if (!Object.hasOwn(options, value.fallback) || typeof timeoutMs !== "number" ||
-		!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
-		throw new Error("Jev fallback must be an allowed route; timeoutMs must be 1..60000.");
-	}
-	const monitor = value.monitor === undefined ? true : value.monitor;
-	if (typeof monitor !== "boolean") throw new Error("Jev monitor must be a boolean.");
-	const skills = value.skills === undefined ? false : value.skills;
-	if (typeof skills !== "boolean") throw new Error("Jev skills must be a boolean.");
-	const evaluationProvider = value.evaluationProvider === undefined ? "vercel-ai-gateway" : value.evaluationProvider;
-	if (evaluationProvider !== "openrouter" && evaluationProvider !== "vercel-ai-gateway") {
-		throw new Error("Jev evaluationProvider must be \"openrouter\" or \"vercel-ai-gateway\".");
-	}
-	return { options, fallback: value.fallback, timeoutMs, monitor, skills, evaluationProvider, minThinking: parseMinThinking(value.minThinking, "global floor") };
-}
-
-function thinkingProfiles(model: Model<Api>, route: RouteOption, minimum: ModelThinkingLevel | undefined, inherited: ModelThinkingLevel = "off") {
-	const choices = route.thinking === "auto" ? AUTO_THINKING : typeof route.thinking === "object" ? route.thinking : undefined;
-	const floor = model.provider === ASTRA_PROVIDER && model.id === ASTRA_MODEL && route.minThinking !== undefined
-		? THINKING_LEVELS.indexOf(route.minThinking)
-		: Math.max(THINKING_LEVELS.indexOf(minimum ?? "off"), THINKING_LEVELS.indexOf(route.minThinking ?? "off"));
-	const supported = getSupportedThinkingLevels(model).filter((level) => THINKING_LEVELS.indexOf(level) >= floor);
-	const requested = clampThinkingLevel(model, typeof route.thinking === "string" && route.thinking !== "auto" ? route.thinking : inherited);
-	const levels = choices ? supported.filter((level) => Object.hasOwn(choices, level))
-		: supported.filter((level) => THINKING_LEVELS.indexOf(level) >= THINKING_LEVELS.indexOf(requested)).slice(0, 1);
-	return levels.map((thinking) => ({ thinking, effort: choices?.[thinking] ?? "User-configured effort." }));
-}
-
-type EffortEntry = { sessionId: string; key: string; thinking: ModelThinkingLevel; update?: { index: number; prefix: string } };
-
-function digest(value: unknown) {
-	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
-
-// Keep updates at their original serialized input boundaries. Compaction or
-// edited history invalidates their prefix hashes; re-establish effort at the end.
-export function effortPayload(payload: unknown, entries: EffortEntry[], thinking: ModelThinkingLevel, initial: ModelThinkingLevel, mapping: Model<Api>["thinkingLevelMap"] = {}) {
-	if (!isRecord(payload) || !Array.isArray(payload.input) || !isRecord(payload.reasoning)) {
-		throw new Error("Astra adaptive thinking requires a Responses input array and reasoning settings.");
-	}
-	if (payload.context_management !== undefined || (payload.truncation !== undefined && payload.truncation !== "disabled")) {
-		throw new Error("Astra effort updates cannot be combined with provider-side automatic compaction or truncation.");
-	}
-	const raw = payload.input;
-	const apiEffort = (level: ModelThinkingLevel) => level === "off" ? mapping?.off ?? "none" : mapping?.[level] ?? level;
-	const updates = new Map<number, ModelThinkingLevel>();
-	// ponytail: O(updates × input) prefix checks; use incremental hashes if long
-	// sessions with frequent effort changes make serialization measurable.
-	for (const entry of entries) {
-		if (entry.update && entry.update.index <= raw.length && digest(raw.slice(0, entry.update.index)) === entry.update.prefix) {
-			updates.set(entry.update.index, entry.thinking);
-		}
-	}
-	const ordered = [...updates].sort(([a], [b]) => a - b);
-	const previous = ordered.at(-1)?.[1] ?? initial;
-	const update = previous !== thinking ? { index: raw.length, prefix: digest(raw) } : undefined;
-	if (update) updates.set(update.index, thinking);
-	const input: unknown[] = [];
-	for (let index = 0; index <= raw.length; index++) {
-		const effort = updates.get(index);
-		if (effort) input.push({ type: "configuration_update", reasoning: { effort: apiEffort(effort) } });
-		if (index < raw.length) {
-			if (isRecord(raw[index]) && raw[index].type === "configuration_update") throw new Error("Astra effort updates must be owned by Jev, not another payload hook.");
-			input.push(raw[index]);
-		}
-	}
-	return { payload: { ...payload, reasoning: { ...payload.reasoning, effort: apiEffort(initial) }, input }, update };
-}
-
-function textOf(message: { content: Context["messages"][number]["content"] }): string {
-	return typeof message.content === "string" ? message.content :
-		message.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
-}
-
-type ToolFailureEvidence = { tool: string; isError: true; excerpt?: string };
-
-function redactFailure(text: string) {
-	return text
-		.replace(/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
-		.replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, "$1 [REDACTED]")
-		.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|rk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sentry_[A-Za-z0-9_-]{20,}|rnd[_-][A-Za-z0-9_-]{20,})\b/gi, "[REDACTED TOKEN]")
-		.replace(/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/gi, "[REDACTED AWS KEY]")
-		.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s\/:@]+:[^\s\/@]+@/gi, "$1[REDACTED]@")
-		.replace(/(\b(?:[A-Za-z0-9]+[_-])*(?:api[_-]?(?:key|token)|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?access[_-]?key|private[_-]?key|pass(?:word|phrase)|secret|token))\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)/gi, "$1=[REDACTED]");
-}
-
-function toolFailureEvidence(context: Context) {
-	const errors = context.messages.filter((message) => {
-		const result = message as unknown as { role?: unknown; isError?: unknown };
-		return result.role === "toolResult" && result.isError === true;
-	}).slice(-MAX_ROUTING_FAILURES);
-	const failures: ToolFailureEvidence[] = errors.map((message) => {
-		const metadata = message as typeof message & { toolName?: unknown; timestamp?: unknown };
-		const text = redactFailure(textOf(message));
-		const marker = "\n[excerpt omitted]\n";
-		const room = MAX_FAILURE_EXCERPT - marker.length;
-		const head = Math.ceil(room / 2);
-		const excerpt = text.length > MAX_FAILURE_EXCERPT ? `${text.slice(0, head)}${marker}${text.slice(-(room - head))}` : text;
-		return { tool: typeof metadata.toolName === "string" ? metadata.toolName.slice(0, 80) : "tool", isError: true, ...(excerpt ? { excerpt } : {}) };
-	});
-	return {
-		failures,
-		key: digest(errors.map((message) => {
-			const metadata = message as typeof message & { toolName?: unknown; timestamp?: unknown };
-			return [metadata.timestamp, metadata.toolName, digest(textOf(message))];
-		})),
-	};
-}
-
-export function routingInput(context: Context) {
-	// Pi converts custom context messages to user messages before provider dispatch.
-	// Our injected instructions are not a new user turn or routing evidence.
-	context = { ...context, messages: context.messages.filter((message) => {
-		const text = textOf(message);
-		return message.role !== "user" || !text.startsWith("<jev-router-skills>\n") || !text.endsWith("\n</jev-router-skills>");
-	}) };
-	const index = context.messages.findLastIndex((message) => message.role === "user");
-	const user = context.messages[index];
-	const text = user ? textOf(user) : "";
-	const key = createHash("sha256").update(JSON.stringify([user?.timestamp, text])).digest("hex");
-	if (!text.trim()) return { key, messages: undefined };
-	if (Buffer.byteLength(text, "utf8") > ROUTING_BYTES) {
-		return { key, messages: undefined, reason: `latest user text exceeds the ${ROUTING_BYTES}-byte routing limit` };
-	}
-	const messages: { role: string; text: string }[] = [];
-	let bytes = 0;
-	for (let i = index; i >= 0 && messages.length < 8; i--) {
-		const message = context.messages[i];
-		if (message.role !== "user" && message.role !== "assistant") continue;
-		const content = textOf(message);
-		if (!content.trim()) continue;
-		const size = Buffer.byteLength(content, "utf8");
-		if (bytes + size > ROUTING_BYTES) break;
-		bytes += size;
-		messages.unshift({ role: message.role, text: content });
-	}
-	return { key, messages };
-}
-
-function chunkRoutingText(text: string, questions: unknown, failures: ToolFailureEvidence[] = []) {
-	// Code-point offsets keep Unicode intact across both boundaries and overlaps.
-	const characters = Array.from(text);
-	const requestExcerpts = { opening: characters.slice(0, 256).join(""), closing: characters.slice(-256).join("") };
-	const makeChunk = (index: number, start: number, end: number) => ({
-		stage: "chunk", requestExcerpts,
-		...(failures.length ? { failures } : {}),
-		chunk: { index, start, end, text: characters.slice(start, end).join("") },
-	});
-	const chunks: ReturnType<typeof makeChunk>[] = [];
-	for (let start = 0; start < characters.length;) {
-		if (chunks.length === MAX_CHUNKS) throw new RoutingBudgetError(`task requires more than ${MAX_CHUNKS} routing chunks; no partial assessment used`);
-		let low = start + 1, high = characters.length, end = start;
-		while (low <= high) {
-			const middle = Math.floor((low + high) / 2);
-			if (fitsEvaluation(makeChunk(chunks.length, start, middle), questions)) {
-				end = middle;
-				low = middle + 1;
-			} else high = middle - 1;
-		}
-		// Prefer a nearby paragraph/line boundary without making tiny chunks.
-		if (end < characters.length) {
-			for (let boundary = end; boundary > start + (end - start) * 0.75; boundary--) {
-				if (characters[boundary - 1] === "\n") { end = boundary; break; }
-			}
-		}
-		if (end - start <= CHUNK_OVERLAP && end < characters.length) {
-			throw new RoutingBudgetError("route descriptions leave insufficient room for chunk evaluation");
-		}
-		chunks.push(makeChunk(chunks.length, start, end));
-		if (end === characters.length) break;
-		start = end - CHUNK_OVERLAP;
-	}
-	return chunks;
-}
-
-// Registry auth resolution has no signal parameter. Stop waiting on cancellation,
-// without changing Pi's ownership of token refresh or storing credentials here.
-async function abortable<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-	signal?.throwIfAborted();
-	if (!signal) return work();
-	let onAbort: () => void = () => {};
-	const cancelled = new Promise<never>((_, reject) => {
-		onAbort = () => reject(signal.reason);
-		signal.addEventListener("abort", onAbort, { once: true });
-	});
-	try {
-		return await Promise.race([work(), cancelled]);
-	} finally {
-		signal.removeEventListener("abort", onAbort);
-	}
-}
-
-// Shared Jev evaluation setup: resolve the configured provider's key through Pi's
-// model-registry auth (never through settings.json) and build its evaluation model.
-async function evaluationModel(registry: { getProviderAuth(provider: string): Promise<{ auth?: { apiKey?: string } } | undefined> }, provider: EvaluationProvider, signal?: AbortSignal) {
-	const auth = await abortable(() => registry.getProviderAuth(provider), signal);
-	if (!auth?.auth?.apiKey) {
-		const { login, env } = EVALUATION_CREDENTIALS[provider];
-		throw new EvaluationAuthError(`Jev evaluation provider "${provider}" is not authenticated. Configure ${login} or set ${env}.`);
-	}
-	return provider === "openrouter"
-		? createOpenRouter({ apiKey: auth.auth.apiKey }).evaluationModel(EVALUATION_MODEL[provider])
-		: createGateway({ apiKey: auth.auth.apiKey }).evaluationModel(EVALUATION_MODEL[provider]);
-}
-
-type LoadedSkill = { name: string; path: string; content: string };
-
-function isLoadedSkill(value: unknown): value is LoadedSkill {
-	return isRecord(value) && typeof value.name === "string" && typeof value.path === "string" && typeof value.content === "string";
-}
-
-function xmlAttribute(value: string) {
-	return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-function skillPath(path: string, cwd: string) {
-	const expanded = path.replace(/^@/, "").replace(/^~\//, `${homedir()}/`);
-	const absolute = resolve(cwd, expanded);
-	try { return realpathSync(absolute); } catch { return absolute; }
-}
-
-function loadedSkillPaths(messages: ContextEvent["messages"], systemPrompt: string, cwd: string) {
-	const loaded = new Set<string>();
-	const reads = new Map<string, string>();
-	const scan = (text: string) => {
-		for (const match of text.matchAll(/<skill\s+name="[^"]*"\s+location="([^"]+)">[\s\S]*?<\/skill>/g)) {
-			const path = match[1].replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
-			loaded.add(skillPath(path, cwd));
-		}
-	};
-	scan(systemPrompt);
-	for (const message of messages) {
-		if ("content" in message) scan(textOf(message));
-		if (message.role === "assistant") {
-			for (const part of message.content) {
-				if (part.type === "toolCall" && part.name === "read" && typeof part.arguments.path === "string" &&
-					(part.arguments.offset === undefined || part.arguments.offset === 1) && part.arguments.limit === undefined) {
-					reads.set(part.id, skillPath(part.arguments.path, cwd));
-				}
-			}
-		}
-		if (message.role === "toolResult" && message.toolName === "read" && !message.isError) {
-			const path = reads.get(message.toolCallId);
-			const details: unknown = message.details;
-			const truncated = isRecord(details) && isRecord(details.truncation) && details.truncation.truncated;
-			if (path && !truncated && !/\[(?:Output truncated|Showing lines )/.test(textOf(message))) loaded.add(path);
-		}
-	}
-	return loaded;
-}
-
-function skillMessage(loaded: LoadedSkill[]): ContextEvent["messages"][number] {
-	return { role: "custom", customType: "jev-skills", content: `<jev-router-skills>\n${loaded.map((skill) => skill.content).join("\n\n")}\n</jev-router-skills>`, display: false, timestamp: 0 };
-}
+export { effortPayload, parseConfig, routingInput };
 
 export default function jevRouter(pi: ExtensionAPI) {
 	const settingsPath = join(getAgentDir(), "settings.json");
@@ -474,7 +80,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			messages.splice(++i, 0, skillMessage(loaded));
 			for (const skill of loaded) present.add(skillPath(skill.path, ctx.cwd));
 		}
-		const input = routingInput({ messages: messages.filter((message) => message.role === "user" || message.role === "assistant") });
+		const input = routingInput({ messages: messages.filter((message) => message.role === "user" || message.role === "assistant") }, config.evidence === "latest" ? 1 : 8);
 		if (saved.has(input.key) || !input.messages) return { messages };
 		const offered = [...new Map(skills.filter((skill) => !present.has(skillPath(skill.filePath, ctx.cwd)))
 			.map((skill) => [skillPath(skill.filePath, ctx.cwd), skill])).values()];
@@ -495,7 +101,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			const ranked = offered.map((skill, index) => ({ skill, probability: result.answers[String(index)]?.probability }));
 			if (ranked.some(({ probability }) => typeof probability !== "number" || !Number.isFinite(probability) || probability < 0 || probability > 1)) throw new Error("invalid skill answers");
 			let bytes = 0;
-			for (const { skill } of ranked.filter(({ probability }) => probability >= 0.8).sort((a, b) => b.probability - a.probability).slice(0, 3)) {
+			for (const { skill } of ranked.filter(({ probability }) => probability >= config.skillProbability).sort((a, b) => b.probability - a.probability).slice(0, config.maxSkills)) {
 				try {
 					const body = stripFrontmatter(readFileSync(skill.filePath, "utf8"));
 					const content = `<skill name="${xmlAttribute(skill.name)}" location="${xmlAttribute(skill.filePath)}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
@@ -507,9 +113,9 @@ export default function jevRouter(pi: ExtensionAPI) {
 					ctx.ui.notify(`Jev could not load skill ${skill.name}; use the normal skill workflow.`, "warning");
 				}
 			}
-		} catch {
+		} catch (error) {
 			if (ctx.signal?.aborted) return;
-			ctx.ui.notify("Jev skill selection skipped: unavailable, timed out, or over budget. Normal skill loading remains available.", "warning");
+			ctx.ui.notify(`Jev skill selection skipped: unavailable, timed out, or over budget${config.debug ? ` (${safeErrorLabel(error)})` : ""}. Normal skill loading remains available.`, "warning");
 		}
 		// Even an empty selection is recorded so tool continuations do not retry.
 		pi.appendEntry("jev-skills", { key: input.key, loaded });
@@ -567,7 +173,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		if (!route.adaptiveThinking && !entries.length) return undefined;
 		const astra = selection.target === ASTRA_REF;
 		const main = options.sessionId === ctx.sessionManager.getSessionId();
-		const key = digest(context.messages);
+		const key = contextDigest(context.messages);
 		const saved = main ? entries.findLast((entry) => entry.key === key) : undefined;
 		let thinking = saved?.thinking ?? entries.at(-1)?.thinking ?? selection.thinking;
 		if (main && pinned && route.adaptiveThinking && !saved) {
@@ -585,7 +191,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 				return !(text.startsWith("<jev-router-skills>\n") && text.endsWith("\n</jev-router-skills>"));
 			});
 			const failures = toolFailureEvidence(context).failures;
-			const recent = messages.slice(-8).map((message) => ({
+			const recent = messages.slice(config.evidence === "latest" ? -1 : -8).map((message) => ({
 				role: message.role, text: excerpt(textOf(message)),
 				...(message.role === "assistant" && Array.isArray(message.content)
 					? { tools: message.content.filter((part) => part.type === "toolCall").map((part) => part.name) }
@@ -609,9 +215,9 @@ export default function jevRouter(pi: ExtensionAPI) {
 					if (!selected) throw new Error("invalid effort choice");
 					thinking = selected.thinking;
 				}
-			} catch {
+			} catch (error) {
 				options.signal?.throwIfAborted();
-				ctx.ui.notify("Jev effort check failed or exceeded its budget. Keeping the current effort.", "warning");
+				ctx.ui.notify(`Jev effort check failed or exceeded its budget${config.debug ? ` (${safeErrorLabel(error)})` : ""}. Keeping the current effort.`, "warning");
 			}
 		}
 		if (!getSupportedThinkingLevels(target).includes(thinking)) throw new Error(`The current effort for ${selection.target} is no longer supported. Fork or select a concrete model.`);
@@ -645,15 +251,16 @@ export default function jevRouter(pi: ExtensionAPI) {
 
 	function showStatus(ctx: ExtensionContext) {
 		ctx.ui.setStatus("jev-router", ctx.model?.provider === PROVIDER && ctx.model.id === MODEL
-			? pinned ? `auto: ${pinned.target} (${currentEffort(ctx) ?? pinned.thinking}, ${config.options[pinned.target]?.adaptiveThinking ? "adaptive" : "pinned"})` : "auto: Jev (not yet pinned)"
+			? pinned ? `auto: ${pinned.target} (${currentEffort(ctx) ?? pinned.thinking}, ${pinned.provisional ? "fallback" : config.options[pinned.target]?.adaptiveThinking ? "adaptive" : "pinned"})` : "auto: Jev (not yet pinned)"
 			: undefined);
 	}
 
 	async function choose(ctx: ExtensionContext, context: Context, models: Model<Api>[], options: SimpleStreamOptions): Promise<Pin> {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const mainRequest = options.sessionId === sessionId;
-		const pin = pinned;
-		const input = routingInput(context);
+		const existingPin = pinned;
+		const pin = existingPin && !existingPin.provisional ? existingPin : undefined;
+		const input = routingInput(context, config.evidence === "latest" ? 1 : 8);
 		const failureEvidence = toolFailureEvidence(context);
 		const failures = failureEvidence.failures;
 		const key = digest([input.key, failureEvidence.key]);
@@ -680,13 +287,18 @@ export default function jevRouter(pi: ExtensionAPI) {
 				thinking: currentThinking, effort: "Keep the pinned model; consider a supported effort increase before a fork when adaptive effort is enabled.",
 			} });
 		}
-		if (!profiles.length) throw new Error("No Jev routes support the configured thinking choices and minimums for this input.");
 		const fallback = (reason: string): Selection => {
-			if (pin) return { ...pin, source: "fallback", reason };
+			// Keep whatever model this session is already using, provisional or not.
+			const available = existingPin && models.some((model) => `${model.provider}/${model.id}` === existingPin.target) ? existingPin : undefined;
+			if (available) return { target: available.target, thinking: available.thinking, source: "fallback", reason, ...(available.provisional ? { provisional: true } : {}) };
 			const profile = profiles.findLast((profile) => profile.target === config.fallback);
 			if (!profile) throw new Error(`Jev fallback ${config.fallback} is unavailable or cannot handle this input and thinking policy.`);
 			return { target: profile.target, thinking: profile.thinking, source: "fallback", reason };
 		};
+		if (!profiles.length) {
+			if (existingPin) return fallback("no eligible Jev routes for this input");
+			throw new Error("No Jev routes support the configured thinking choices and minimums for this input.");
+		}
 		// Before the first pin, auxiliary calls use fallback without pinning a session.
 		if (!mainRequest) return fallback("auxiliary request");
 		const { messages, reason } = input;
@@ -698,7 +310,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			selection = fallback(reason ?? "no user text");
 		} else {
 			const offered = new Map(profiles.map((profile, index) => [String(index), profile]));
-			const questions = {
+			let questions = {
 				route: {
 					type: "choice" as const,
 					instructions: pin
@@ -723,12 +335,15 @@ export default function jevRouter(pi: ExtensionAPI) {
 			const signal = AbortSignal.any([stop.signal, deadline, ...(options.signal ? [options.signal] : [])]);
 			const metrics = { evaluationRequests: 0, routingChunks: 0, inputTokens: 0, outputTokens: 0, usageIncomplete: false };
 			try {
-				const chunkQuestions = { route: questions.route };
+				let chunkQuestions = { route: questions.route };
 				const routingState = { messages, ...(failures.length ? { failures } : {}) };
 				while (messages.length > 1 && !fitsEvaluation(routingState, questions)) messages.shift();
 				let chunks: ReturnType<typeof chunkRoutingText> = [];
 				if (!fitsEvaluation(routingState, questions)) {
-					questions.route.instructions += " For chunk states, assess that section using the bounded request excerpts as context; they may omit instructions elsewhere. Judge the requested work, not just the apparent complexity of pasted reference material. For combined states, assess the task as a whole using every chunk assessment, including minority requirements and possible cross-section dependencies. Do not average scores or take a majority vote: routine sections must not drown out a demanding requirement.";
+					// Build a fresh object instead of mutating in place: fitsEvaluation caches the
+					// serialized questions by object identity, so a mutation would not be counted.
+					questions = { ...questions, route: { ...questions.route, instructions: `${questions.route.instructions} For chunk states, assess that section using the bounded request excerpts as context; they may omit instructions elsewhere. Judge the requested work, not just the apparent complexity of pasted reference material. For combined states, assess the task as a whole using every chunk assessment, including minority requirements and possible cross-section dependencies. Do not average scores or take a majority vote: routine sections must not drown out a demanding requirement.` } };
+					chunkQuestions = { route: questions.route };
 					chunks = chunkRoutingText(messages[messages.length - 1].text, chunkQuestions, failures);
 					metrics.routingChunks = chunks.length;
 				}
@@ -751,7 +366,13 @@ export default function jevRouter(pi: ExtensionAPI) {
 							return result.answers;
 						} catch (error) {
 							metrics.usageIncomplete = true;
-							if (timeout.aborted && !signal.aborted && attempt < EVALUATION_ATTEMPTS) continue;
+							const timedOut = timeout.aborted && !signal.aborted;
+							const retryable = timedOut || retryableEvaluationError(error);
+							if (retryable && attempt < EVALUATION_ATTEMPTS && !signal.aborted && performance.now() < expiresAt) {
+								// Bounded exponential backoff with jitter for transient timeouts, 429s, and 5xx responses.
+								await delay(Math.min(250 * 2 ** (attempt - 1), 2_000) * (0.5 + Math.random()), undefined, { signal });
+								continue;
+							}
 							throw timeout.aborted ? timeout.reason : error;
 						}
 					}
@@ -779,8 +400,8 @@ export default function jevRouter(pi: ExtensionAPI) {
 				if (performance.now() >= expiresAt) throw new RoutingBudgetError("Jev timed out");
 				const profile = offered.get(decision.route.choice);
 				if (!profile) throw new Error("invalid route");
-				if (pin && profile.target !== pin.target && !confidentPoorFit(decision.poorFit)) {
-					selection = { ...pin, source: "guarded", reason: `poor-fit confidence below ${POOR_FIT_THRESHOLD}; keeping the session pin` };
+				if (pin && profile.target !== pin.target && !confidentPoorFit(decision.poorFit, config.poorFitThreshold)) {
+					selection = { ...pin, source: "guarded", reason: `poor-fit confidence below ${config.poorFitThreshold}; keeping the session pin` };
 				} else selection = { target: profile.target, thinking: profile.thinking, source: "jev" };
 			} catch (error) {
 				// Never expose SDK error bodies: they may contain conversation text.
@@ -789,8 +410,9 @@ export default function jevRouter(pi: ExtensionAPI) {
 				const label = config.evaluationProvider === "openrouter" ? "OpenRouter" : "Gateway";
 				const reason = error instanceof EvaluationAuthError ? error.message : status === 401 ? `${label} rejected credentials (401); update the ${label} key` :
 					status ? `Jev request failed (HTTP ${status})` : `Jev unavailable; check ${label} login/key and connectivity`;
-				selection = fallback(error instanceof RoutingBudgetError ? error.message :
-					deadline.aborted || (error instanceof Error && error.name === "TimeoutError") ? "Jev timed out" : reason);
+				const detail = config.debug && !(error instanceof EvaluationAuthError) ? ` [${safeErrorLabel(error)}]` : "";
+				selection = fallback((error instanceof RoutingBudgetError ? error.message :
+					deadline.aborted || (error instanceof Error && error.name === "TimeoutError") ? "Jev timed out" : reason) + detail);
 			} finally {
 				stop.abort();
 			}
@@ -798,8 +420,13 @@ export default function jevRouter(pi: ExtensionAPI) {
 		}
 		options.signal?.throwIfAborted();
 		checkedKey = key;
-		lastRoute = { ...selection, purpose: pin ? "monitor" : "route", milliseconds: Date.now() - started, estimatedCost: (selection.inputTokens ?? 0) * JEV_INPUT_COST_PER_MILLION / 1_000_000 };
-		pi.appendEntry(pin ? "jev-monitor" : "jev-route", { ...lastRoute, sessionId, key });
+		lastRoute = {
+			...selection,
+			purpose: existingPin ? "monitor" : "route",
+			milliseconds: Date.now() - started,
+			estimatedCost: ((selection.inputTokens ?? 0) * config.evaluationCost.inputPerMillion + (selection.outputTokens ?? 0) * config.evaluationCost.outputPerMillion) / 1_000_000,
+		};
+		pi.appendEntry(existingPin ? "jev-monitor" : "jev-route", { ...lastRoute, sessionId, key });
 		if (pin) {
 			if (selection.source === "jev" && selection.target !== pin.target && !suggestedModels.has(selection.target)) {
 				lastSuggestion = { target: selection.target, thinking: selection.thinking };
@@ -809,7 +436,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			}
 			return pin;
 		}
-		if (selection.source === "fallback") ctx.ui.notify(`Jev: ${selection.reason}. Using ${selection.target}.`, "warning");
+		if (selection.source === "fallback" && !existingPin) ctx.ui.notify(`Jev: ${selection.reason}. Using ${selection.target}.`, "warning");
 		return selection;
 	}
 
@@ -865,11 +492,16 @@ export default function jevRouter(pi: ExtensionAPI) {
 				if (!getSupportedThinkingLevels(target).includes(thinking)) {
 					throw new Error("The pinned Jev thinking level is no longer supported. Fork or select a concrete model.");
 				}
-				if (!pinned && options.sessionId === ctx.sessionManager.getSessionId()) {
-					const pin = { target: selection.target, thinking: selection.thinking };
-					pi.appendEntry("jev-pin", { ...pin, sessionId: ctx.sessionManager.getSessionId(), key: checkedKey });
-					pinned = pin;
-					showStatus(ctx);
+				if ((!pinned || pinned.provisional) && options.sessionId === ctx.sessionManager.getSessionId()) {
+					// A fallback chosen after an evaluation failure becomes a provisional pin: requests keep
+					// flowing, but the next main request re-routes until Jev returns a real decision.
+					const provisional = selection.source === "fallback" && !config.pinFallback;
+					if (!pinned || !provisional) {
+						const pin = { target: selection.target, thinking: selection.thinking, ...(provisional ? { provisional: true } : {}) };
+						pi.appendEntry("jev-pin", { ...pin, sessionId: ctx.sessionManager.getSessionId(), key: checkedKey });
+						pinned = pin;
+						showStatus(ctx);
+					}
 				}
 				const providerThinking = selection.target === ASTRA_REF ? selection.thinking : thinking;
 				const downstream = provider.streamSimple(auth.baseUrl ? { ...target, baseUrl: auth.baseUrl } : target, context, {
@@ -912,12 +544,14 @@ export default function jevRouter(pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type !== "custom" || !isRecord(entry.data) || entry.data.sessionId !== ctx.sessionManager.getSessionId()) continue;
 			const data = entry.data;
+			// A reset entry clears any pin or suggestion recorded before it on this session.
+			if (entry.customType === "jev-reset") { pinned = undefined; checkedKey = undefined; continue; }
 			if (entry.customType === "jev-pin" || entry.customType === "jev-suggestion") {
 				const thinking = THINKING_LEVELS.find((level) => level === data.thinking);
 				if (typeof data.target !== "string" || !/^[^/]+\/.+/.test(data.target) || data.target.startsWith(`${PROVIDER}/`) || !thinking) {
 					throw new Error(`Invalid saved ${entry.customType} entry. Repair the session or start a new one.`);
 				}
-				const route = { target: data.target, thinking };
+				const route = { target: data.target, thinking, ...(entry.customType === "jev-pin" && data.provisional === true ? { provisional: true } : {}) };
 				if (entry.customType === "jev-pin") pinned = route;
 				else { lastSuggestion = route; suggestedModels.add(route.target); }
 			}
@@ -960,17 +594,53 @@ export default function jevRouter(pi: ExtensionAPI) {
 	pi.on("session_tree", (_event, ctx) => { showStatus(ctx); });
 	pi.on("session_shutdown", () => { active = undefined; pinned = undefined; checkedKey = undefined; skills = []; });
 	pi.registerCommand("jev", {
-		description: "Show the pinned Jev model, current effort, and fork suggestions",
-		handler: async (_args, ctx) => {
+		description: "Show or adjust Jev routing: /jev [reset | pin <provider/model> [thinking]]",
+		handler: async (args, ctx) => {
+			const [action, ref, level] = (args ?? "").trim().split(/\s+/);
+			if (action === "reset") {
+				pi.appendEntry("jev-reset", { sessionId: ctx.sessionManager.getSessionId() });
+				pinned = undefined;
+				checkedKey = undefined;
+				lastRoute = undefined;
+				lastSuggestion = undefined;
+				suggestedModels.clear();
+				showStatus(ctx);
+				ctx.ui.notify("Jev: cleared the session pin and fork suggestions. The next request will re-route.", "info");
+				return;
+			}
+			if (action === "pin") {
+				const route = ref ? config.options[ref] : undefined;
+				const target = ref ? candidates(ctx).find((model) => `${model.provider}/${model.id}` === ref) : undefined;
+				if (!route || !target) {
+					ctx.ui.notify(`Jev: ${ref ?? ""} is not a configured, authenticated route. Check jevRouter.options and /login.`, "warning");
+					return;
+				}
+				const allowed = thinkingProfiles(target, route, config.minThinking);
+				const chosen = level ? allowed.find((profile) => profile.thinking === level) : allowed[0];
+				if (!chosen) {
+					ctx.ui.notify(`Jev: ${ref} does not allow thinking ${level}. Allowed: ${allowed.map((profile) => profile.thinking).join(", ") || "none"}.`, "warning");
+					return;
+				}
+				pinned = { target: ref, thinking: chosen.thinking };
+				pi.appendEntry("jev-pin", { target: ref, thinking: chosen.thinking, sessionId: ctx.sessionManager.getSessionId() });
+				lastRoute = undefined;
+				showStatus(ctx);
+				ctx.ui.notify(`Jev: pinned ${ref} at ${chosen.thinking} thinking.`, "info");
+				return;
+			}
+			if (action) {
+				ctx.ui.notify("Usage: /jev [reset | pin <provider/model> [thinking]]", "warning");
+				return;
+			}
 			const routes = Object.entries(config.options).map(([ref, route]) => `${ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");
 			const { login, env } = EVALUATION_CREDENTIALS[config.evaluationProvider];
 			const evaluator = ctx.modelRegistry.getProviderAuthStatus(config.evaluationProvider).configured ? "configured" : `missing: ${login} or ${env}`;
-			const pin = pinned ? `${pinned.target}, thinking ${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking} (initial ${pinned.thinking})` : "not yet selected";
+			const pin = pinned ? `${pinned.target}, thinking ${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking} (initial ${pinned.thinking})${pinned.provisional ? " [fallback; re-routing]" : ""}` : "not yet selected";
 			const last = lastRoute ? lastRoute.purpose === "monitor" && lastRoute.source === "fallback"
 				? `\nLast monitor failed: ${lastRoute.reason}. Keeping the session pin.`
 				: `\nLast ${lastRoute.purpose}: ${lastRoute.target}, thinking ${lastRoute.thinking} (${lastRoute.source}, ${lastRoute.milliseconds}ms, evaluations: ${lastRoute.evaluationRequests ?? 0}${lastRoute.routingChunks ? `, chunks planned: ${lastRoute.routingChunks}` : ""}, estimated Jev $${lastRoute.estimatedCost.toFixed(6)}${lastRoute.usageIncomplete ? "; usage incomplete" : ""})` : "";
 			const suggestion = lastSuggestion ? `\nFork suggestion: ${lastSuggestion.target}, thinking ${lastSuggestion.thinking}` : "";
-			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}
+			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}\nEvidence: ${config.evidence}\nThresholds: poor-fit ${config.poorFitThreshold}, skill ${config.skillProbability}\nDebug: ${config.debug ? "on" : "off"}
 Evaluator: ${config.evaluationProvider} (${evaluator})${last}${suggestion}\nConfig: ${configSource}\nEdit jevRouter in ${settingsPath}, then /reload. Model and initial-effort changes apply to new sessions. Adaptive effort applies after reload.`, "info");
 		},
 	});

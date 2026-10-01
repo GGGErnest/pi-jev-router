@@ -23,6 +23,7 @@ process.stdout.write(JSON.stringify({
 NODE
 
 cp index.ts index.test.mjs "$tmp/"
+cp -R src "$tmp/"
 (
 	cd "$tmp"
 	npm install --no-save --ignore-scripts --no-audit --no-fund --no-package-lock \
