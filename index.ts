@@ -46,6 +46,15 @@ const MAX_FAILURE_EXCERPT = 512;
 const POOR_FIT_THRESHOLD = 0.85;
 // Keep aligned with Pi's default compaction reserve (16,384 tokens).
 const CONTEXT_RESERVE_TOKENS = 16_384;
+// Codex Astra is the only route whose Responses requests are updated with append-only
+// configuration_update items to preserve prompt-cache reuse, and the only route allowed to
+// lower the global thinking floor through an explicit model minimum. Keep its identity in one
+// place so these behaviors stay consistent if the model reference ever changes.
+const ASTRA_REF = "openai-codex/gpt-6-astra";
+const ASTRA_PROVIDER = "openai-codex";
+const ASTRA_MODEL = "gpt-6-astra";
+// TypeSafe Jev 1.13 bills $0.042 per 1M input tokens; output tokens are free.
+const JEV_INPUT_COST_PER_MILLION = 0.042;
 
 class RoutingBudgetError extends Error {}
 class EvaluationAuthError extends Error {}
@@ -79,12 +88,12 @@ const DEFAULT_CONFIG: Config = {
 			description: "Middle tier for bounded implementation needing investigation, ordinary debugging, local correctness reviews, and integration within established architecture. Not for routine execution Luna can handle, architectural direction, difficult debugging, or high-stakes advice.",
 			thinking: "auto",
 		},
-		"openai-codex/gpt-6-astra": {
+		[ASTRA_REF]: {
 			description: "Highest-intelligence reasoning and advisor for critical thinking, recommendations, architecture, hard debugging, interacting failure modes, security-critical decisions, and complex ambiguity. Not for mechanical execution, simple summaries, or bounded implementation without substantive judgment.",
 			thinking: "xhigh",
 		},
 	},
-	fallback: "openai-codex/gpt-6-astra",
+	fallback: ASTRA_REF,
 	timeoutMs: 5000,
 	monitor: true,
 	skills: false,
@@ -175,7 +184,7 @@ export function parseConfig(value: unknown): Config {
 
 function thinkingProfiles(model: Model<Api>, route: RouteOption, minimum: ModelThinkingLevel | undefined, inherited: ModelThinkingLevel = "off") {
 	const choices = route.thinking === "auto" ? AUTO_THINKING : typeof route.thinking === "object" ? route.thinking : undefined;
-	const floor = model.provider === "openai-codex" && model.id === "gpt-6-astra" && route.minThinking !== undefined
+	const floor = model.provider === ASTRA_PROVIDER && model.id === ASTRA_MODEL && route.minThinking !== undefined
 		? THINKING_LEVELS.indexOf(route.minThinking)
 		: Math.max(THINKING_LEVELS.indexOf(minimum ?? "off"), THINKING_LEVELS.indexOf(route.minThinking ?? "off"));
 	const supported = getSupportedThinkingLevels(model).filter((level) => THINKING_LEVELS.indexOf(level) >= floor);
@@ -556,7 +565,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		const entries = effortEntries(ctx);
 		const route = config.options[selection.target];
 		if (!route.adaptiveThinking && !entries.length) return undefined;
-		const astra = selection.target === "openai-codex/gpt-6-astra";
+		const astra = selection.target === ASTRA_REF;
 		const main = options.sessionId === ctx.sessionManager.getSessionId();
 		const key = digest(context.messages);
 		const saved = main ? entries.findLast((entry) => entry.key === key) : undefined;
@@ -570,8 +579,11 @@ export default function jevRouter(pi: ExtensionAPI) {
 				criteria: Object.fromEntries(profiles.map(({ thinking, effort }) => [thinking, effort])),
 			} };
 			const excerpt = (text: string) => text.length <= 1600 ? text : `${text.slice(0, 800)}\n[excerpt omitted]\n${text.slice(-800)}`;
-			const messages = context.messages.filter((message) => (message.role === "user" || message.role === "assistant") &&
-				!textOf(message).startsWith("<jev-router-skills>\n"));
+			const messages = context.messages.filter((message) => {
+				if (message.role !== "user" && message.role !== "assistant") return false;
+				const text = textOf(message);
+				return !(text.startsWith("<jev-router-skills>\n") && text.endsWith("\n</jev-router-skills>"));
+			});
 			const failures = toolFailureEvidence(context).failures;
 			const recent = messages.slice(-8).map((message) => ({
 				role: message.role, text: excerpt(textOf(message)),
@@ -627,9 +639,13 @@ export default function jevRouter(pi: ExtensionAPI) {
 		return { thinking, onPayload };
 	}
 
+	function currentEffort(ctx: ExtensionContext): ModelThinkingLevel | undefined {
+		try { return effortEntries(ctx).at(-1)?.thinking; } catch { return undefined; }
+	}
+
 	function showStatus(ctx: ExtensionContext) {
 		ctx.ui.setStatus("jev-router", ctx.model?.provider === PROVIDER && ctx.model.id === MODEL
-			? pinned ? `auto: ${pinned.target} (${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking}, ${config.options[pinned.target]?.adaptiveThinking ? "adaptive" : "pinned"})` : "auto: Jev (not yet pinned)"
+			? pinned ? `auto: ${pinned.target} (${currentEffort(ctx) ?? pinned.thinking}, ${config.options[pinned.target]?.adaptiveThinking ? "adaptive" : "pinned"})` : "auto: Jev (not yet pinned)"
 			: undefined);
 	}
 
@@ -782,7 +798,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		}
 		options.signal?.throwIfAborted();
 		checkedKey = key;
-		lastRoute = { ...selection, purpose: pin ? "monitor" : "route", milliseconds: Date.now() - started, estimatedCost: (selection.inputTokens ?? 0) * 0.042 / 1_000_000 };
+		lastRoute = { ...selection, purpose: pin ? "monitor" : "route", milliseconds: Date.now() - started, estimatedCost: (selection.inputTokens ?? 0) * JEV_INPUT_COST_PER_MILLION / 1_000_000 };
 		pi.appendEntry(pin ? "jev-monitor" : "jev-route", { ...lastRoute, sessionId, key });
 		if (pin) {
 			if (selection.source === "jev" && selection.target !== pin.target && !suggestedModels.has(selection.target)) {
@@ -855,7 +871,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 					pinned = pin;
 					showStatus(ctx);
 				}
-				const providerThinking = selection.target === "openai-codex/gpt-6-astra" ? selection.thinking : thinking;
+				const providerThinking = selection.target === ASTRA_REF ? selection.thinking : thinking;
 				const downstream = provider.streamSimple(auth.baseUrl ? { ...target, baseUrl: auth.baseUrl } : target, context, {
 					...options,
 					onPayload: adaptation?.onPayload ?? options.onPayload,
@@ -890,6 +906,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		checkedKey = undefined;
 		lastRoute = undefined;
 		lastSuggestion = undefined;
+		skills = [];
 		suggestedModels.clear();
 		// Pins belong to the whole session, not a tree branch. Forks get a new ID.
 		for (const entry of ctx.sessionManager.getEntries()) {
@@ -905,6 +922,31 @@ export default function jevRouter(pi: ExtensionAPI) {
 				else { lastSuggestion = route; suggestedModels.add(route.target); }
 			}
 			if ((entry.customType === "jev-pin" || entry.customType === "jev-monitor") && typeof data.key === "string") checkedKey = data.key;
+			// Restore the latest routing/monitoring diagnostic so /jev still reports it after a reload.
+			if (entry.customType === "jev-route" || entry.customType === "jev-monitor") {
+				const level = THINKING_LEVELS.find((level) => level === data.thinking);
+				const source = data.source;
+				if (typeof data.target === "string" && typeof data.purpose === "string" &&
+					(data.purpose === "route" || data.purpose === "monitor") &&
+					typeof data.milliseconds === "number" && Number.isFinite(data.milliseconds) &&
+					typeof data.estimatedCost === "number" && Number.isFinite(data.estimatedCost) &&
+					level && (source === "jev" || source === "fallback" || source === "single" || source === "guarded")) {
+					lastRoute = {
+						target: data.target,
+						thinking: level,
+						source,
+						purpose: data.purpose,
+						milliseconds: data.milliseconds,
+						estimatedCost: data.estimatedCost,
+						...(typeof data.reason === "string" ? { reason: data.reason } : {}),
+						...(typeof data.inputTokens === "number" ? { inputTokens: data.inputTokens } : {}),
+						...(typeof data.outputTokens === "number" ? { outputTokens: data.outputTokens } : {}),
+						...(typeof data.evaluationRequests === "number" ? { evaluationRequests: data.evaluationRequests } : {}),
+						...(typeof data.routingChunks === "number" ? { routingChunks: data.routingChunks } : {}),
+						...(typeof data.usageIncomplete === "boolean" ? { usageIncomplete: data.usageIncomplete } : {}),
+					};
+				}
+			}
 		}
 		const available = candidates(ctx);
 		register(available, available.find((model) => `${model.provider}/${model.id}` === pinned?.target));
@@ -916,7 +958,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 	});
 	pi.on("model_select", (_event, ctx) => { showStatus(ctx); });
 	pi.on("session_tree", (_event, ctx) => { showStatus(ctx); });
-	pi.on("session_shutdown", () => { active = undefined; pinned = undefined; checkedKey = undefined; });
+	pi.on("session_shutdown", () => { active = undefined; pinned = undefined; checkedKey = undefined; skills = []; });
 	pi.registerCommand("jev", {
 		description: "Show the pinned Jev model, current effort, and fork suggestions",
 		handler: async (_args, ctx) => {

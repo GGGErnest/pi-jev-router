@@ -18,3 +18,15 @@ jobs:
           node-version: 22.19.0
       - run: nub install --frozen-lockfile --ignore-scripts
       - run: nub run test
+
+  # The lockfile pins Pi 0.85.1; users run newer Pi releases. Smoke-test the
+  # latest published Pi without touching the lockfile.
+  smoke-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+      - name: Smoke test against the latest published Pi
+        run: bash scripts/smoke-latest.sh 0.99.1

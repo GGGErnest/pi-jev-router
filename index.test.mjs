@@ -1613,3 +1613,26 @@ test("/jev diagnostics name the selected evaluator and its missing credentials",
 	await gateway.commands.get("jev").handler("", gateway.ctx);
 	assert.match(gateway.notices.at(-1)[0], /Evaluator: vercel-ai-gateway \(configured\)/);
 });
+
+test("restores the latest routing diagnostic after reload", async (t) => {
+	const history = [{ name: "jev-route", data: {
+		target: FAST, thinking: "max", source: "jev", purpose: "route", milliseconds: 42,
+		estimatedCost: 0.000042, sessionId: "main", key: "saved-key",
+		inputTokens: 1000, outputTokens: 0, evaluationRequests: 1, usageIncomplete: false,
+	} }];
+	const h = await harness({ refs: [FAST], history });
+	await h.commands.get("jev").handler("", h.ctx);
+	assert.match(h.notices.at(-1)[0], /Last route: openai-codex\/gpt-5.6-luna, thinking max \(jev, 42ms, evaluations: 1, estimated Jev \$0\.000042\)/);
+});
+
+test("corrupt saved effort entries never break status updates or session start", async (t) => {
+	const history = [
+		{ name: "jev-pin", data: { target: FAST, thinking: "low", sessionId: "main", key: "saved-key" } },
+		{ name: "jev-effort", data: { sessionId: "main", key: "k", thinking: "bogus" } },
+	];
+	const h = await harness({ refs: [FAST], history });
+	let status;
+	h.ctx.ui.setStatus = (_key, value) => { status = value; };
+	await h.handlers.get("session_tree")({}, h.ctx);
+	assert.match(status, /low, pinned/);
+});
