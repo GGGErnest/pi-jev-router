@@ -49,6 +49,10 @@ type RouteOption = { description: string | RouteCriteria; thinking?: ModelThinki
 type RouteProfile = { target: string; thinking: ModelThinkingLevel; description: { model: string; task: string | RouteCriteria; thinking?: ModelThinkingLevel; effort: string; keepCurrentModel?: boolean } };
 type EvaluationCost = { inputPerMillion: number; outputPerMillion: number };
 type EvidenceScope = "recent" | "latest";
+// A named provider profile redirects the route refs and fallback in `options` to another
+// provider (for example the same models served by OpenRouter). It is a static, load-time
+// switch: change activeProfile and reload instead of rewriting every route by hand.
+type ProviderProfile = Record<string, string>;
 type Config = {
 	options: Record<string, RouteOption>;
 	fallback: string;
@@ -64,6 +68,8 @@ type Config = {
 	evidence: EvidenceScope;
 	debug: boolean;
 	evaluationCost: EvaluationCost;
+	profiles: Record<string, ProviderProfile>;
+	activeProfile?: string;
 };
 const DEFAULT_CONFIG: Config = {
 	options: {
@@ -92,6 +98,7 @@ const DEFAULT_CONFIG: Config = {
 	evidence: "recent",
 	debug: false,
 	evaluationCost: { inputPerMillion: JEV_INPUT_COST_PER_MILLION, outputPerMillion: 0 },
+	profiles: {},
 };
 type Selection = {
 	target: string;
@@ -156,6 +163,26 @@ function parseEvidence(value: unknown): EvidenceScope {
 	return value;
 }
 
+function isRouteRef(ref: string) {
+	return /^[^/]+\/.+/.test(ref) && !ref.startsWith(`${PROVIDER}/`);
+}
+
+function parseProfiles(value: unknown) {
+	if (value === undefined) return {} as Record<string, ProviderProfile>;
+	if (!isRecord(value)) throw new Error("Jev profiles must be an object.");
+	const profiles: Record<string, ProviderProfile> = {};
+	for (const [name, mapping] of Object.entries(value)) {
+		if (!isRecord(mapping)) throw new Error(`Jev profile "${name}" must map route refs to route refs.`);
+		const redirects: ProviderProfile = {};
+		for (const [from, to] of Object.entries(mapping)) {
+			if (!isRouteRef(from) || typeof to !== "string" || !isRouteRef(to)) throw new Error(`Invalid Jev route redirect in profile "${name}": ${from}.`);
+			redirects[from] = to;
+		}
+		profiles[name] = redirects;
+	}
+	return profiles;
+}
+
 export function parseConfig(value: unknown): Config {
 	if (!isRecord(value) || !isRecord(value.options) || typeof value.fallback !== "string") {
 		throw new Error("Jev configuration requires options and a fallback model.");
@@ -188,7 +215,24 @@ export function parseConfig(value: unknown): Config {
 		options[ref] = { description: option.description, thinking, minThinking: parseMinThinking(option.minThinking, ref), adaptiveThinking };
 	}
 	const timeoutMs = value.timeoutMs ?? 5000;
-	if (!Object.hasOwn(options, value.fallback) || typeof timeoutMs !== "number" ||
+	const profiles = parseProfiles(value.profiles);
+	const activeProfile = value.activeProfile === undefined ? undefined : value.activeProfile;
+	if (activeProfile !== undefined && (typeof activeProfile !== "string" || !Object.hasOwn(profiles, activeProfile))) {
+		throw new Error("Jev activeProfile must name a configured profile.");
+	}
+	const redirect = activeProfile ? profiles[activeProfile] : undefined;
+	const fallback = redirect?.[value.fallback] ?? value.fallback;
+	if (redirect) {
+		const redirected: Record<string, RouteOption> = {};
+		for (const [ref, option] of Object.entries(options)) {
+			const target = redirect[ref] ?? ref;
+			if (Object.hasOwn(redirected, target)) throw new Error(`Jev profile "${activeProfile}" maps multiple routes to ${target}.`);
+			redirected[target] = option;
+		}
+		for (const key of Object.keys(options)) delete options[key];
+		Object.assign(options, redirected);
+	}
+	if (!Object.hasOwn(options, fallback) || typeof timeoutMs !== "number" ||
 		!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
 		throw new Error("Jev fallback must be an allowed route; timeoutMs must be 1..60000.");
 	}
@@ -203,7 +247,7 @@ export function parseConfig(value: unknown): Config {
 	if (value.evaluationCost !== undefined && !isRecord(value.evaluationCost)) throw new Error("Jev evaluationCost must be an object.");
 	const evaluationCost = isRecord(value.evaluationCost) ? value.evaluationCost : {};
 	return {
-		options, fallback: value.fallback, timeoutMs, monitor, skills, evaluationProvider,
+		options, fallback, timeoutMs, monitor, skills, evaluationProvider,
 		minThinking: parseMinThinking(value.minThinking, "global floor"),
 		pinFallback: parseBoolean(value.pinFallback, "pinFallback", false),
 		poorFitThreshold: parseProbability(value.poorFitThreshold, "poorFitThreshold", DEFAULT_POOR_FIT_THRESHOLD),
@@ -215,6 +259,8 @@ export function parseConfig(value: unknown): Config {
 			inputPerMillion: parseCostPerMillion(evaluationCost.inputPerMillion, "evaluationCost.inputPerMillion", JEV_INPUT_COST_PER_MILLION),
 			outputPerMillion: parseCostPerMillion(evaluationCost.outputPerMillion, "evaluationCost.outputPerMillion", 0),
 		},
+		profiles,
+		activeProfile,
 	};
 }
 
@@ -227,5 +273,5 @@ export {
 };
 export type {
 	EvaluationProvider, ThinkingChoices, RouteCriteria, RouteOption, RouteProfile, EvaluationCost,
-	EvidenceScope, Config, Selection, Pin,
+	EvidenceScope, Config, Selection, Pin, ProviderProfile,
 };

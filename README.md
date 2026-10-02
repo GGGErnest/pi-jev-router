@@ -65,6 +65,31 @@ Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra
 
 Optional tuning knobs (defaults shown): `evidence` is `"recent"` (up to eight recent user/assistant messages) or `"latest"` (only the newest user message); `pinFallback` is `false`, so a fallback chosen after an evaluation failure is provisional and re-routed on the next request, while `true` locks it for the session; `poorFitThreshold` is `0.85` and `skillProbability` is `0.8` (each `0`–`1`); `maxSkills` is `3`; `debug` is `false` and adds a safe failure label to warnings without exposing SDK error bodies, and also records the full skill-relevance ranking on the session entry for auditing; and `evaluationCost` sets the `inputPerMillion` (default `0.042`) and `outputPerMillion` (default `0`) rates used for the `/jev` estimate. Invalid values fail at load.
 
+### Switching providers
+
+Define a named `profiles` map and select one with `activeProfile` to move every route and the fallback to the same models on another provider without rewriting the route list. Profiles are applied when settings load; reload after changing `activeProfile`.
+
+```json
+"jevRouter": {
+  "options": {
+    "opencode-go/gpt-6-luna": { "description": "Small fixes and routine implementation.", "thinking": "auto" },
+    "opencode-go/deepseek-v4.1-flash": { "description": "Balanced investigation.", "thinking": "auto" }
+  },
+  "fallback": "opencode-go/deepseek-v4.1-flash",
+  "profiles": {
+    "openrouter": {
+      "opencode-go/gpt-6-luna": "openrouter/openai/gpt-6-luna",
+      "opencode-go/deepseek-v4.1-flash": "openrouter/deepseek/deepseek-v4.1-flash"
+    }
+  },
+  "activeProfile": "openrouter"
+}
+```
+
+The active profile remaps matching route keys and the fallback before routing; routes not listed in the profile keep their original ref. A mapped ref must be a valid, authenticated `provider/model`, and two routes must not map to the same ref. Descriptions, `thinking`, `minThinking`, and `adaptiveThinking` are preserved because they belong to the route, not the ref. Omit `activeProfile` (or `profiles`) to use the configured refs unchanged; `/jev` shows the active profile and its redirect count. This is a manual, load-time switch, not an automatic failover.
+
+Use it when a provider runs out of credit: point `activeProfile` at a profile that mirrors the same models on another provider, then `/reload`. Existing session pins keep the ref they were created with; after switching profiles, run `/jev reset` (or start a new session) to re-route under the new provider.
+
 Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
 
 Use Luna for known-approach execution, Sol for bounded investigation and implementation within an established architecture, and Astra for advisory judgment, architecture, critical thinking, and difficult debugging. High effort never expands a model's scope. Sol's middle-tier role should be validated on your workload. Existing string descriptions remain supported.

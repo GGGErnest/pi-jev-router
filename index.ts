@@ -269,7 +269,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		const key = digest([input.key, failureEvidence.key]);
 		if (pin) {
 			const target = models.find((model) => `${model.provider}/${model.id}` === pin.target);
-			if (!target) throw new Error("The pinned Jev route is unavailable or cannot handle this input. Fork or select a concrete model.");
+			if (!target) throw new Error("The pinned Jev route is unavailable or cannot handle this input for the active provider profile. Fork or select a concrete model, or use /jev reset.");
 			if (!getSupportedThinkingLevels(target).includes(pin.thinking)) throw new Error("The pinned Jev thinking level is no longer supported. Fork or select a concrete model.");
 			if (!mainRequest || !config.monitor) return pin;
 			if (key === checkedKey || (!input.messages && !input.reason)) return pin;
@@ -643,7 +643,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 				? `\nLast monitor failed: ${lastRoute.reason}. Keeping the session pin.`
 				: `\nLast ${lastRoute.purpose}: ${lastRoute.target}, thinking ${lastRoute.thinking} (${lastRoute.source}, ${lastRoute.milliseconds}ms, evaluations: ${lastRoute.evaluationRequests ?? 0}${lastRoute.routingChunks ? `, chunks planned: ${lastRoute.routingChunks}` : ""}, estimated Jev $${lastRoute.estimatedCost.toFixed(6)}${lastRoute.usageIncomplete ? "; usage incomplete" : ""})` : "";
 			const suggestion = lastSuggestion ? `\nFork suggestion: ${lastSuggestion.target}, thinking ${lastSuggestion.thinking}` : "";
-			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}\nEvidence: ${config.evidence}\nThresholds: poor-fit ${config.poorFitThreshold}, skill ${config.skillProbability}\nDebug: ${config.debug ? "on" : "off"}
+			ctx.ui.notify(`Jev routes:\n${routes}\nGlobal minimum thinking: ${config.minThinking ?? "off"}\nPinned: ${pin}\nMonitor: ${config.monitor ? "on" : "off"}\nSkills: ${config.skills ? "on" : "off"}\nFallback: ${config.fallback}\nProfile: ${config.activeProfile ? `${config.activeProfile} (${Object.keys(config.profiles[config.activeProfile] ?? {}).length} redirects)` : "none"}\nEvidence: ${config.evidence}\nThresholds: poor-fit ${config.poorFitThreshold}, skill ${config.skillProbability}\nDebug: ${config.debug ? "on" : "off"}
 Evaluator: ${config.evaluationProvider} (${evaluator})${last}${suggestion}\nConfig: ${configSource}\nEdit jevRouter in ${settingsPath}, then /reload. Model and initial-effort changes apply to new sessions. Adaptive effort applies after reload.`, "info");
 		},
 	});
