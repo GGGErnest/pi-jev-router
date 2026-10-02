@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -29,22 +29,26 @@ export { effortPayload, parseConfig, routingInput };
 
 export default function jevRouter(pi: ExtensionAPI) {
 	const settingsPath = join(getAgentDir(), "settings.json");
-	let content = "{}";
-	try {
-		content = readFileSync(settingsPath, "utf8");
-	} catch (error) {
-		if (!isRecord(error) || error.code !== "ENOENT") throw error;
+	function readSettings(): Record<string, unknown> {
+		let content = "{}";
+		try {
+			content = readFileSync(settingsPath, "utf8");
+		} catch (error) {
+			if (!isRecord(error) || error.code !== "ENOENT") throw error;
+		}
+		let settings: unknown;
+		try {
+			settings = JSON.parse(content.replace(/^\uFEFF/, ""));
+		} catch {
+			// JSON parse errors can quote secrets from unrelated global settings.
+			throw new Error(`Invalid JSON in ${settingsPath}.`);
+		}
+		if (!isRecord(settings)) throw new Error(`Expected a JSON object in ${settingsPath}.`);
+		return settings;
 	}
-	let settings: unknown;
-	try {
-		settings = JSON.parse(content.replace(/^\uFEFF/, ""));
-	} catch {
-		// JSON parse errors can quote secrets from unrelated global settings.
-		throw new Error(`Invalid JSON in ${settingsPath}.`);
-	}
-	if (!isRecord(settings)) throw new Error(`Expected a JSON object in ${settingsPath}.`);
-	const configured = Object.hasOwn(settings, "jevRouter");
-	const config = parseConfig(configured ? settings.jevRouter : DEFAULT_CONFIG);
+	const initialSettings = readSettings();
+	const configured = Object.hasOwn(initialSettings, "jevRouter");
+	let config = parseConfig(configured ? initialSettings.jevRouter : DEFAULT_CONFIG);
 	const configSource = configured ? `${settingsPath} (jevRouter)` : "built-in defaults";
 	let active: ExtensionContext | undefined;
 	let pinned: Pin | undefined;
@@ -597,7 +601,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 	pi.on("session_tree", (_event, ctx) => { showStatus(ctx); });
 	pi.on("session_shutdown", () => { active = undefined; pinned = undefined; checkedKey = undefined; skills = []; });
 	pi.registerCommand("jev", {
-		description: "Show or adjust Jev routing: /jev [reset | pin <provider/model> [thinking]]",
+		description: "Show or adjust Jev routing: /jev [reset | pin <provider/model> [thinking] | profile [name|none]]",
 		handler: async (args, ctx) => {
 			const [action, ref, level] = (args ?? "").trim().split(/\s+/);
 			if (action === "reset") {
@@ -631,8 +635,54 @@ export default function jevRouter(pi: ExtensionAPI) {
 				ctx.ui.notify(`Jev: pinned ${ref} at ${chosen.thinking} thinking.`, "info");
 				return;
 			}
+			if (action === "profile") {
+				const available = Object.keys(config.profiles);
+				const clearing = ref === "none" || ref === "off" || ref === "default";
+				if (!ref) {
+					ctx.ui.notify(`Jev active profile: ${config.activeProfile ?? "none"}. Available: ${available.join(", ") || "none"}. Use /jev profile <name> or /jev profile none.`, "info");
+					return;
+				}
+				if (!clearing && !Object.hasOwn(config.profiles, ref)) {
+					ctx.ui.notify(`Jev: unknown profile ${ref}. Available: ${available.join(", ") || "none"}.`, "warning");
+					return;
+				}
+				const describe = (error: unknown) => error instanceof Error ? error.message : "unknown error";
+				let settings: Record<string, unknown>;
+				try {
+					settings = readSettings();
+				} catch (error) {
+					ctx.ui.notify(`Jev: cannot read ${settingsPath}: ${describe(error)}.`, "warning");
+					return;
+				}
+				if (!isRecord(settings.jevRouter)) {
+					ctx.ui.notify(`Jev: no jevRouter configuration to update in ${settingsPath}.`, "warning");
+					return;
+				}
+				const jevRouter = { ...settings.jevRouter };
+				if (clearing) delete jevRouter.activeProfile;
+				else jevRouter.activeProfile = ref;
+				let next: Config;
+				try {
+					next = parseConfig(jevRouter);
+				} catch (error) {
+					ctx.ui.notify(`Jev: cannot switch profile: ${describe(error)}.`, "warning");
+					return;
+				}
+				writeFileSync(settingsPath, `${JSON.stringify({ ...settings, jevRouter }, null, 2)}\n`);
+				config = next;
+				if (pinned) pi.appendEntry("jev-reset", { sessionId: ctx.sessionManager.getSessionId() });
+				pinned = undefined;
+				checkedKey = undefined;
+				lastRoute = undefined;
+				lastSuggestion = undefined;
+				suggestedModels.clear();
+				register(candidates(ctx), undefined);
+				showStatus(ctx);
+				ctx.ui.notify(`Jev: active profile is now ${clearing ? "none" : ref}. Run /reload to refresh the provider, then continue (existing pins were cleared).`, "info");
+				return;
+			}
 			if (action) {
-				ctx.ui.notify("Usage: /jev [reset | pin <provider/model> [thinking]]", "warning");
+				ctx.ui.notify("Usage: /jev [reset | pin <provider/model> [thinking] | profile [name|none]]", "warning");
 				return;
 			}
 			const routes = Object.entries(config.options).map(([ref, route]) => `${ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");

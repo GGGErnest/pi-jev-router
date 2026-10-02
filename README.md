@@ -88,7 +88,7 @@ Define a named `profiles` map and select one with `activeProfile` to move every 
 
 The active profile remaps matching route keys and the fallback before routing; routes not listed in the profile keep their original ref. A mapped ref must be a valid, authenticated `provider/model`, and two routes must not map to the same ref. Descriptions, `thinking`, `minThinking`, and `adaptiveThinking` are preserved because they belong to the route, not the ref. Omit `activeProfile` (or `profiles`) to use the configured refs unchanged; `/jev` shows the active profile and its redirect count. This is a manual, load-time switch, not an automatic failover.
 
-Use it when a provider runs out of credit: point `activeProfile` at a profile that mirrors the same models on another provider, then `/reload`. Existing session pins keep the ref they were created with; after switching profiles, run `/jev reset` (or start a new session) to re-route under the new provider.
+Switch at runtime with `/jev profile <name>` (or `/jev profile none` to clear). It writes `activeProfile` to `settings.json`, applies the new routes immediately, and clears the session pin so the current session re-routes. Run `/reload` afterwards to refresh the provider registration. `/jev profile` with no argument lists the current profile and the available names. You can also edit `activeProfile` directly and `/reload`.
 
 Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
 

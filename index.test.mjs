@@ -1842,3 +1842,31 @@ test("a pin from a previous provider profile fails clearly instead of crashing",
 	assert.equal(result.stopReason, "error");
 	assert.match(result.errorMessage, /pinned Jev route is unavailable.*active provider profile/);
 });
+
+test("/jev profile switches the active provider profile, persists it, and re-routes", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { "opencode-go/luna": { description: "Routine" }, "opencode-go/deep": { description: "Deep" } },
+		fallback: "opencode-go/deep",
+		profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna", "opencode-go/deep": "openrouter/deep/deep" } },
+	} }));
+	const requests = mockGateway(t, (_options, body) => Object.values(body.questions.route.criteria)[0].model);
+	const h = await harness({ refs: ["opencode-go/luna", "opencode-go/deep", "openrouter/openai/luna", "openrouter/deep/deep"] });
+	await h.stream().result();
+	assert.equal(h.calls[0].model.provider, "opencode-go");
+	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.target, "opencode-go/luna");
+	await h.commands.get("jev").handler("profile", h.ctx);
+	assert.match(h.notices.at(-1)[0], /active profile: none.*openrouter/);
+	await h.commands.get("jev").handler("profile bogus", h.ctx);
+	assert.match(h.notices.at(-1)[0], /unknown profile bogus/);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, undefined);
+	await h.commands.get("jev").handler("profile openrouter", h.ctx);
+	assert.match(h.notices.at(-1)[0], /active profile is now openrouter/);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, "openrouter");
+	await h.stream(context("Next", 2)).result();
+	assert.equal(h.calls.at(-1).model.provider, "openrouter");
+	assert.ok(h.entries.some((entry) => entry.name === "jev-reset"), "switching clears existing pins");
+	await h.commands.get("jev").handler("profile none", h.ctx);
+	assert.match(h.notices.at(-1)[0], /active profile is now none/);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, undefined);
+});
