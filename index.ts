@@ -601,7 +601,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 	pi.on("session_tree", (_event, ctx) => { showStatus(ctx); });
 	pi.on("session_shutdown", () => { active = undefined; pinned = undefined; checkedKey = undefined; skills = []; });
 	pi.registerCommand("jev", {
-		description: "Show or adjust Jev routing: /jev [reset | pin <provider/model> [thinking] | profile [name|none]]",
+		description: "Show or adjust Jev routing: /jev [reset | pin <route|provider/model> [thinking] | profile <name>]",
 		handler: async (args, ctx) => {
 			const [action, ref, level] = (args ?? "").trim().split(/\s+/);
 			if (action === "reset") {
@@ -616,33 +616,33 @@ export default function jevRouter(pi: ExtensionAPI) {
 				return;
 			}
 			if (action === "pin") {
-				const route = ref ? config.options[ref] : undefined;
-				const target = ref ? candidates(ctx).find((model) => `${model.provider}/${model.id}` === ref) : undefined;
-				if (!route || !target) {
+				const resolved = ref ? config.routeAliases[ref] ?? ref : undefined;
+				const route = resolved ? config.options[resolved] : undefined;
+				const target = resolved ? candidates(ctx).find((model) => `${model.provider}/${model.id}` === resolved) : undefined;
+				if (!resolved || !route || !target) {
 					ctx.ui.notify(`Jev: ${ref ?? ""} is not a configured, authenticated route. Check jevRouter.options and /login.`, "warning");
 					return;
 				}
 				const allowed = thinkingProfiles(target, route, config.minThinking);
 				const chosen = level ? allowed.find((profile) => profile.thinking === level) : allowed[0];
 				if (!chosen) {
-					ctx.ui.notify(`Jev: ${ref} does not allow thinking ${level}. Allowed: ${allowed.map((profile) => profile.thinking).join(", ") || "none"}.`, "warning");
+					ctx.ui.notify(`Jev: ${resolved} does not allow thinking ${level}. Allowed: ${allowed.map((profile) => profile.thinking).join(", ") || "none"}.`, "warning");
 					return;
 				}
-				pinned = { target: ref, thinking: chosen.thinking };
-				pi.appendEntry("jev-pin", { target: ref, thinking: chosen.thinking, sessionId: ctx.sessionManager.getSessionId() });
+				pinned = { target: resolved, thinking: chosen.thinking };
+				pi.appendEntry("jev-pin", { target: resolved, thinking: chosen.thinking, sessionId: ctx.sessionManager.getSessionId() });
 				lastRoute = undefined;
 				showStatus(ctx);
-				ctx.ui.notify(`Jev: pinned ${ref} at ${chosen.thinking} thinking.`, "info");
+				ctx.ui.notify(`Jev: pinned ${resolved} at ${chosen.thinking} thinking.`, "info");
 				return;
 			}
 			if (action === "profile") {
 				const available = Object.keys(config.profiles);
-				const clearing = ref === "none" || ref === "off" || ref === "default";
 				if (!ref) {
-					ctx.ui.notify(`Jev active profile: ${config.activeProfile ?? "none"}. Available: ${available.join(", ") || "none"}. Use /jev profile <name> or /jev profile none.`, "info");
+					ctx.ui.notify(`Jev active profile: ${config.activeProfile ?? "none"}. Available: ${available.join(", ") || "none"}. Use /jev profile <name>.`, "info");
 					return;
 				}
-				if (!clearing && !Object.hasOwn(config.profiles, ref)) {
+				if (!Object.hasOwn(config.profiles, ref)) {
 					ctx.ui.notify(`Jev: unknown profile ${ref}. Available: ${available.join(", ") || "none"}.`, "warning");
 					return;
 				}
@@ -658,9 +658,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 					ctx.ui.notify(`Jev: no jevRouter configuration to update in ${settingsPath}.`, "warning");
 					return;
 				}
-				const jevRouter = { ...settings.jevRouter };
-				if (clearing) delete jevRouter.activeProfile;
-				else jevRouter.activeProfile = ref;
+				const jevRouter = { ...settings.jevRouter, activeProfile: ref };
 				let next: Config;
 				try {
 					next = parseConfig(jevRouter);
@@ -678,14 +676,15 @@ export default function jevRouter(pi: ExtensionAPI) {
 				suggestedModels.clear();
 				register(candidates(ctx), undefined);
 				showStatus(ctx);
-				ctx.ui.notify(`Jev: active profile is now ${clearing ? "none" : ref}. Run /reload to refresh the provider, then continue (existing pins were cleared).`, "info");
+				ctx.ui.notify(`Jev: active profile is now ${ref}. Run /reload to refresh the provider, then continue (existing pins were cleared).`, "info");
 				return;
 			}
 			if (action) {
-				ctx.ui.notify("Usage: /jev [reset | pin <provider/model> [thinking] | profile [name|none]]", "warning");
+				ctx.ui.notify("Usage: /jev [reset | pin <route|provider/model> [thinking] | profile <name>]", "warning");
 				return;
 			}
-			const routes = Object.entries(config.options).map(([ref, route]) => `${ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");
+			const aliasByRef = new Map(Object.entries(config.routeAliases).map(([name, ref]) => [ref, name]));
+			const routes = Object.entries(config.options).map(([ref, route]) => `${aliasByRef.has(ref) ? `${aliasByRef.get(ref)} -> ${ref}` : ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");
 			const { login, env } = EVALUATION_CREDENTIALS[config.evaluationProvider];
 			const evaluator = ctx.modelRegistry.getProviderAuthStatus(config.evaluationProvider).configured ? "configured" : `missing: ${login} or ${env}`;
 			const pin = pinned ? `${pinned.target}, thinking ${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking} (initial ${pinned.thinking})${pinned.provisional ? " [fallback; re-routing]" : ""}` : "not yet selected";

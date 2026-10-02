@@ -70,6 +70,8 @@ type Config = {
 	evaluationCost: EvaluationCost;
 	profiles: Record<string, ProviderProfile>;
 	activeProfile?: string;
+	// Resolved placeholder name -> concrete `provider/model` ref for the active profile.
+	routeAliases: Record<string, string>;
 };
 const DEFAULT_CONFIG: Config = {
 	options: {
@@ -99,6 +101,7 @@ const DEFAULT_CONFIG: Config = {
 	debug: false,
 	evaluationCost: { inputPerMillion: JEV_INPUT_COST_PER_MILLION, outputPerMillion: 0 },
 	profiles: {},
+	routeAliases: {},
 };
 type Selection = {
 	target: string;
@@ -172,10 +175,10 @@ function parseProfiles(value: unknown) {
 	if (!isRecord(value)) throw new Error("Jev profiles must be an object.");
 	const profiles: Record<string, ProviderProfile> = {};
 	for (const [name, mapping] of Object.entries(value)) {
-		if (!isRecord(mapping)) throw new Error(`Jev profile "${name}" must map route refs to route refs.`);
+		if (!isRecord(mapping)) throw new Error(`Jev profile "${name}" must map route placeholders to provider/model refs.`);
 		const redirects: ProviderProfile = {};
 		for (const [from, to] of Object.entries(mapping)) {
-			if (!isRouteRef(from) || typeof to !== "string" || !isRouteRef(to)) throw new Error(`Invalid Jev route redirect in profile "${name}": ${from}.`);
+			if (!/^[^/\s]+$/.test(from) || typeof to !== "string" || !isRouteRef(to)) throw new Error(`Invalid Jev route mapping in profile "${name}": ${from}.`);
 			redirects[from] = to;
 		}
 		profiles[name] = redirects;
@@ -187,52 +190,51 @@ export function parseConfig(value: unknown): Config {
 	if (!isRecord(value) || !isRecord(value.options) || typeof value.fallback !== "string") {
 		throw new Error("Jev configuration requires options and a fallback model.");
 	}
+	const profiles = parseProfiles(value.profiles);
+	const activeProfile = value.activeProfile === undefined ? undefined : value.activeProfile;
+	if (activeProfile !== undefined && (typeof activeProfile !== "string" || !Object.hasOwn(profiles, activeProfile))) {
+		throw new Error("Jev activeProfile must name a configured profile.");
+	}
+	if (Object.keys(profiles).length && activeProfile === undefined) {
+		throw new Error("Jev activeProfile is required when profiles are defined.");
+	}
+	const profile = activeProfile ? profiles[activeProfile] : undefined;
 	const options: Record<string, RouteOption> = {};
-	for (const [ref, option] of Object.entries(value.options)) {
-		if (!/^[^/]+\/.+/.test(ref) || ref.startsWith(`${PROVIDER}/`) ||
+	const routeAliases: Record<string, string> = {};
+	for (const [name, option] of Object.entries(value.options)) {
+		const placeholder = !name.includes("/");
+		if ((placeholder ? !/^[^/\s]+$/.test(name) : !isRouteRef(name)) ||
 			!isRecord(option) || !validDescription(option.description)) {
-			throw new Error(`Invalid Jev route: ${ref}`);
+			throw new Error(`Invalid Jev route: ${name}`);
 		}
 		let thinking: RouteOption["thinking"];
 		if (isRecord(option.thinking)) {
 			const choices: ThinkingChoices = {};
 			for (const [key, description] of Object.entries(option.thinking)) {
 				const level = THINKING_LEVELS.find((level) => level === key);
-				if (!level || typeof description !== "string" || !description.trim()) throw new Error(`Invalid Jev thinking choice for ${ref}: ${key}`);
+				if (!level || typeof description !== "string" || !description.trim()) throw new Error(`Invalid Jev thinking choice for ${name}: ${key}`);
 				choices[level] = description;
 			}
-			if (!Object.keys(choices).length) throw new Error(`Jev thinking choices for ${ref} must not be empty.`);
+			if (!Object.keys(choices).length) throw new Error(`Jev thinking choices for ${name} must not be empty.`);
 			thinking = choices;
 		} else {
 			thinking = option.thinking === "auto" ? "auto" : THINKING_LEVELS.find((level) => level === option.thinking);
-			if (option.thinking !== undefined && thinking === undefined) throw new Error(`Invalid Jev thinking level for ${ref}.`);
+			if (option.thinking !== undefined && thinking === undefined) throw new Error(`Invalid Jev thinking level for ${name}.`);
 		}
 		const adaptiveThinking = option.adaptiveThinking === undefined ? false : option.adaptiveThinking;
 		if (typeof adaptiveThinking !== "boolean" || (adaptiveThinking &&
 			(thinking !== "auto" && typeof thinking !== "object"))) {
-			throw new Error(`Jev adaptiveThinking requires automatic or custom thinking choices: ${ref}`);
+			throw new Error(`Jev adaptiveThinking requires automatic or custom thinking choices: ${name}`);
 		}
-		options[ref] = { description: option.description, thinking, minThinking: parseMinThinking(option.minThinking, ref), adaptiveThinking };
+		const target = placeholder ? profile?.[name] : name;
+		if (!target) throw new Error(`Jev route "${name}" is not mapped by profile "${activeProfile}".`);
+		if (Object.hasOwn(options, target)) throw new Error(`Jev profile "${activeProfile ?? "none"}" maps multiple routes to ${target}.`);
+		options[target] = { description: option.description, thinking, minThinking: parseMinThinking(option.minThinking, name), adaptiveThinking };
+		if (placeholder) routeAliases[name] = target;
 	}
+	const fallback = value.fallback.includes("/") ? value.fallback : profile?.[value.fallback];
 	const timeoutMs = value.timeoutMs ?? 5000;
-	const profiles = parseProfiles(value.profiles);
-	const activeProfile = value.activeProfile === undefined ? undefined : value.activeProfile;
-	if (activeProfile !== undefined && (typeof activeProfile !== "string" || !Object.hasOwn(profiles, activeProfile))) {
-		throw new Error("Jev activeProfile must name a configured profile.");
-	}
-	const redirect = activeProfile ? profiles[activeProfile] : undefined;
-	const fallback = redirect?.[value.fallback] ?? value.fallback;
-	if (redirect) {
-		const redirected: Record<string, RouteOption> = {};
-		for (const [ref, option] of Object.entries(options)) {
-			const target = redirect[ref] ?? ref;
-			if (Object.hasOwn(redirected, target)) throw new Error(`Jev profile "${activeProfile}" maps multiple routes to ${target}.`);
-			redirected[target] = option;
-		}
-		for (const key of Object.keys(options)) delete options[key];
-		Object.assign(options, redirected);
-	}
-	if (!Object.hasOwn(options, fallback) || typeof timeoutMs !== "number" ||
+	if (!fallback || !Object.hasOwn(options, fallback) || typeof timeoutMs !== "number" ||
 		!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
 		throw new Error("Jev fallback must be an allowed route; timeoutMs must be 1..60000.");
 	}
@@ -261,6 +263,7 @@ export function parseConfig(value: unknown): Config {
 		},
 		profiles,
 		activeProfile,
+		routeAliases,
 	};
 }
 

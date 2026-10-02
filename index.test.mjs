@@ -1782,37 +1782,44 @@ test("debug records the considered skill probabilities for auditing", async (t) 
 	assert.equal(plain.entries.find((e) => e.name === "jev-skills").data.considered, undefined);
 });
 
-test("provider profiles redirect routes and fallback, and validate", () => {
+test("provider profiles resolve route placeholders and validate", () => {
 	const base = {
-		options: { "opencode-go/luna": { description: "fast" }, "opencode-go/deep": { description: "deep" } },
-		fallback: "opencode-go/deep",
-	};
-	const redirected = parseConfig({ ...base,
-		profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna", "opencode-go/deep": "openrouter/deep/deep" } },
+		options: { luna: { description: "fast" }, deep: { description: "deep" } },
+		fallback: "deep",
+		profiles: {
+			"opencode-go": { luna: "opencode-go/luna", deep: "opencode-go/deep" },
+			openrouter: { luna: "openrouter/openai/luna", deep: "openrouter/deep/deep" },
+		},
 		activeProfile: "openrouter",
-	});
-	assert.deepEqual(Object.keys(redirected.options), ["openrouter/openai/luna", "openrouter/deep/deep"]);
-	assert.equal(redirected.fallback, "openrouter/deep/deep");
-	assert.equal(redirected.options["openrouter/openai/luna"].description, "fast");
-	assert.equal(redirected.activeProfile, "openrouter");
-	// Without an active profile the original refs are untouched.
-	assert.deepEqual(Object.keys(parseConfig(base).options), ["opencode-go/luna", "opencode-go/deep"]);
-	// Unmapped routes stay on their original provider.
-	const partial = parseConfig({ ...base, profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna" } }, activeProfile: "openrouter" });
-	assert.deepEqual(Object.keys(partial.options), ["openrouter/openai/luna", "opencode-go/deep"]);
-	for (const profiles of [null, [], 1, { p: null }, { p: { "bad": 1 } }, { p: { "auto/x": "openrouter/y" } }, { p: { "a/b": "auto/c" } }]) {
-		assert.throws(() => parseConfig({ ...base, profiles }));
+	};
+	const resolved = parseConfig(base);
+	assert.deepEqual(Object.keys(resolved.options), ["openrouter/openai/luna", "openrouter/deep/deep"]);
+	assert.equal(resolved.fallback, "openrouter/deep/deep");
+	assert.equal(resolved.options["openrouter/openai/luna"].description, "fast");
+	assert.deepEqual(resolved.routeAliases, { luna: "openrouter/openai/luna", deep: "openrouter/deep/deep" });
+	// Switching the profile changes every route without touching the route list.
+	const back = parseConfig({ ...base, activeProfile: "opencode-go" });
+	assert.deepEqual(Object.keys(back.options), ["opencode-go/luna", "opencode-go/deep"]);
+	assert.equal(back.fallback, "opencode-go/deep");
+	// Concrete refs bypass the profile and can coexist with placeholders.
+	const mixed = parseConfig({ ...base, options: { ...base.options, "local/model": { description: "local" } } });
+	assert.ok(Object.keys(mixed.options).includes("local/model"));
+	// Validation.
+	for (const profiles of [null, [], 1, { p: null }, { p: { "bad/name": "openrouter/x" } }, { p: { luna: 1 } }, { p: { luna: "auto/x" } }]) {
+		assert.throws(() => parseConfig({ ...base, profiles, activeProfile: "p" }));
 	}
+	assert.throws(() => parseConfig({ ...base, activeProfile: undefined }), /activeProfile is required/);
 	assert.throws(() => parseConfig({ ...base, activeProfile: "missing" }), /activeProfile/);
-	assert.throws(() => parseConfig({ ...base, profiles: { p: { "opencode-go/luna": "openrouter/x", "opencode-go/deep": "openrouter/x" } }, activeProfile: "p" }), /maps multiple routes/);
+	assert.throws(() => parseConfig({ ...base, activeProfile: "p", profiles: { p: { luna: "openrouter/x", deep: "openrouter/x" } } }), /maps multiple routes/);
+	assert.throws(() => parseConfig({ ...base, activeProfile: "p", profiles: { p: { luna: "openrouter/x" } } }), /"deep" is not mapped/);
 });
 
-test("activeProfile routes to the mapped provider and pins the resolved ref", async (t) => {
+test("an active profile resolves every route to the configured provider", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
-		options: { "opencode-go/luna": { description: "Routine" }, "opencode-go/deep": { description: "Deep" } },
-		fallback: "opencode-go/deep",
-		profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna", "opencode-go/deep": "openrouter/deep/deep" } },
+		options: { luna: { description: "Routine" }, deep: { description: "Deep" } },
+		fallback: "deep",
+		profiles: { openrouter: { luna: "openrouter/openai/luna", deep: "openrouter/deep/deep" } },
 		activeProfile: "openrouter",
 	} }));
 	const requests = mockGateway(t, () => "openrouter/openai/luna");
@@ -1823,15 +1830,16 @@ test("activeProfile routes to the mapped provider and pins the resolved ref", as
 	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.target, "openrouter/openai/luna");
 	assert.deepEqual(Object.values(requests[0].questions.route.criteria).map(({ model }) => model), ["openrouter/openai/luna", "openrouter/deep/deep"]);
 	await h.commands.get("jev").handler("", h.ctx);
-	assert.match(h.notices.at(-1)[0], /Profile: openrouter \(2 redirects\)/);
+	assert.match(h.notices.at(-1)[0], /Profile: openrouter/);
+	assert.match(h.notices.at(-1)[0], /luna -> openrouter\/openai\/luna/);
 });
 
 test("a pin from a previous provider profile fails clearly instead of crashing", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
-		options: { "opencode-go/luna": { description: "Routine" }, "opencode-go/deep": { description: "Deep" } },
-		fallback: "opencode-go/deep",
-		profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna", "opencode-go/deep": "openrouter/deep/deep" } },
+		options: { luna: { description: "Routine" }, deep: { description: "Deep" } },
+		fallback: "deep",
+		profiles: { openrouter: { luna: "openrouter/openai/luna", deep: "openrouter/deep/deep" } },
 		activeProfile: "openrouter",
 	} }));
 	mockGateway(t);
@@ -1846,27 +1854,30 @@ test("a pin from a previous provider profile fails clearly instead of crashing",
 test("/jev profile switches the active provider profile, persists it, and re-routes", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
-		options: { "opencode-go/luna": { description: "Routine" }, "opencode-go/deep": { description: "Deep" } },
-		fallback: "opencode-go/deep",
-		profiles: { openrouter: { "opencode-go/luna": "openrouter/openai/luna", "opencode-go/deep": "openrouter/deep/deep" } },
+		options: { luna: { description: "Routine" }, deep: { description: "Deep" } },
+		fallback: "deep",
+		profiles: {
+			"opencode-go": { luna: "opencode-go/luna", deep: "opencode-go/deep" },
+			openrouter: { luna: "openrouter/openai/luna", deep: "openrouter/deep/deep" },
+		},
+		activeProfile: "opencode-go",
 	} }));
-	const requests = mockGateway(t, (_options, body) => Object.values(body.questions.route.criteria)[0].model);
+	mockGateway(t, (_options, body) => Object.values(body.questions.route.criteria)[0].model);
 	const h = await harness({ refs: ["opencode-go/luna", "opencode-go/deep", "openrouter/openai/luna", "openrouter/deep/deep"] });
 	await h.stream().result();
 	assert.equal(h.calls[0].model.provider, "opencode-go");
 	assert.equal(h.entries.find((entry) => entry.name === "jev-pin").data.target, "opencode-go/luna");
 	await h.commands.get("jev").handler("profile", h.ctx);
-	assert.match(h.notices.at(-1)[0], /active profile: none.*openrouter/);
+	assert.match(h.notices.at(-1)[0], /active profile: opencode-go.*openrouter/);
 	await h.commands.get("jev").handler("profile bogus", h.ctx);
 	assert.match(h.notices.at(-1)[0], /unknown profile bogus/);
-	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, undefined);
+	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, "opencode-go");
 	await h.commands.get("jev").handler("profile openrouter", h.ctx);
 	assert.match(h.notices.at(-1)[0], /active profile is now openrouter/);
 	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, "openrouter");
 	await h.stream(context("Next", 2)).result();
 	assert.equal(h.calls.at(-1).model.provider, "openrouter");
 	assert.ok(h.entries.some((entry) => entry.name === "jev-reset"), "switching clears existing pins");
-	await h.commands.get("jev").handler("profile none", h.ctx);
-	assert.match(h.notices.at(-1)[0], /active profile is now none/);
-	assert.equal(JSON.parse(readFileSync(settingsPath, "utf8")).jevRouter.activeProfile, undefined);
+	await h.commands.get("jev").handler("pin deep", h.ctx);
+	assert.match(h.notices.at(-1)[0], /pinned openrouter\/deep\/deep at /);
 });

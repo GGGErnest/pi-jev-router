@@ -67,28 +67,32 @@ Optional tuning knobs (defaults shown): `evidence` is `"recent"` (up to eight re
 
 ### Switching providers
 
-Define a named `profiles` map and select one with `activeProfile` to move every route and the fallback to the same models on another provider without rewriting the route list. Profiles are applied when settings load; reload after changing `activeProfile`.
+Define routes with short placeholder names, then map each placeholder to a concrete `provider/model` in one or more named `profiles`. Select a profile with `activeProfile`; every route and the fallback resolve through it. Profiles are applied when settings load.
 
 ```json
 "jevRouter": {
   "options": {
-    "opencode-go/gpt-6-luna": { "description": "Small fixes and routine implementation.", "thinking": "auto" },
-    "opencode-go/deepseek-v4.1-flash": { "description": "Balanced investigation.", "thinking": "auto" }
+    "luna": { "description": "Small fixes and routine implementation.", "thinking": "auto" },
+    "deep": { "description": "Balanced investigation.", "thinking": "auto" }
   },
-  "fallback": "opencode-go/deepseek-v4.1-flash",
+  "fallback": "deep",
   "profiles": {
+    "opencode-go": {
+      "luna": "opencode-go/gpt-6-luna",
+      "deep": "opencode-go/deepseek-v4.1-flash"
+    },
     "openrouter": {
-      "opencode-go/gpt-6-luna": "openrouter/openai/gpt-6-luna",
-      "opencode-go/deepseek-v4.1-flash": "openrouter/deepseek/deepseek-v4.1-flash"
+      "luna": "openrouter/openai/gpt-6-luna",
+      "deep": "openrouter/deepseek/deepseek-v4.1-flash"
     }
   },
-  "activeProfile": "openrouter"
+  "activeProfile": "opencode-go"
 }
 ```
 
-The active profile remaps matching route keys and the fallback before routing; routes not listed in the profile keep their original ref. A mapped ref must be a valid, authenticated `provider/model`, and two routes must not map to the same ref. Descriptions, `thinking`, `minThinking`, and `adaptiveThinking` are preserved because they belong to the route, not the ref. Omit `activeProfile` (or `profiles`) to use the configured refs unchanged; `/jev` shows the active profile and its redirect count. This is a manual, load-time switch, not an automatic failover.
+The active profile must map every placeholder route in `options`, and each mapped ref must be a valid, authenticated `provider/model`; two routes cannot resolve to the same ref. A route key containing `/` is treated as a concrete ref and bypasses profiles, which is useful for a model that exists on only one provider. `fallback` is a route name (placeholder or concrete). Descriptions, `thinking`, `minThinking`, and `adaptiveThinking` are defined once on the placeholder and preserved across profiles. When `profiles` is defined, `activeProfile` is required; `/jev` shows the active profile and each placeholder's resolved ref. This is a manual, load-time switch, not an automatic failover.
 
-Switch at runtime with `/jev profile <name>` (or `/jev profile none` to clear). It writes `activeProfile` to `settings.json`, applies the new routes immediately, and clears the session pin so the current session re-routes. Run `/reload` afterwards to refresh the provider registration. `/jev profile` with no argument lists the current profile and the available names. You can also edit `activeProfile` directly and `/reload`.
+Switch at runtime with `/jev profile <name>`: it writes `activeProfile` to `settings.json`, applies the new routes immediately, and clears the session pin so the current session re-routes. Run `/reload` afterwards to refresh the provider registration. `/jev profile` with no argument lists the current profile and the available names. You can also edit `activeProfile` directly and `/reload`. `/jev pin` accepts either a placeholder name (`/jev pin deep xhigh`) or a concrete ref.
 
 Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
 
