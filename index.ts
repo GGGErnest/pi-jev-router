@@ -91,6 +91,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			criteria: { true: { name: skill.name, description: skill.description }, false: "Not directly needed for this request." },
 		}]));
 		const loaded: LoadedSkill[] = [];
+		let considered: { name: string; probability: number }[] | undefined;
 		const signal = AbortSignal.any([AbortSignal.timeout(config.timeoutMs), ...(ctx.signal ? [ctx.signal] : [])]);
 		try {
 			while (input.messages.length > 1 && !fitsEvaluation({ messages: input.messages }, questions)) input.messages.shift();
@@ -100,6 +101,8 @@ export default function jevRouter(pi: ExtensionAPI) {
 			signal.throwIfAborted();
 			const ranked = offered.map((skill, index) => ({ skill, probability: result.answers[String(index)]?.probability }));
 			if (ranked.some(({ probability }) => typeof probability !== "number" || !Number.isFinite(probability) || probability < 0 || probability > 1)) throw new Error("invalid skill answers");
+			// debug records the full ranking so a session can be audited for why a skill was or was not selected.
+			if (config.debug) considered = ranked.map(({ skill, probability }) => ({ name: skill.name, probability })).sort((a, b) => b.probability - a.probability);
 			let bytes = 0;
 			for (const { skill } of ranked.filter(({ probability }) => probability >= config.skillProbability).sort((a, b) => b.probability - a.probability).slice(0, config.maxSkills)) {
 				try {
@@ -118,7 +121,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 			ctx.ui.notify(`Jev skill selection skipped: unavailable, timed out, or over budget${config.debug ? ` (${safeErrorLabel(error)})` : ""}. Normal skill loading remains available.`, "warning");
 		}
 		// Even an empty selection is recorded so tool continuations do not retry.
-		pi.appendEntry("jev-skills", { key: input.key, loaded });
+		pi.appendEntry("jev-skills", { key: input.key, loaded, ...(considered ? { considered, threshold: config.skillProbability, maxSkills: config.maxSkills } : {}) });
 		if (loaded.length) {
 			messages.push(skillMessage(loaded));
 			ctx.ui.notify(`Jev loaded skills: ${loaded.map((skill) => skill.name).join(", ")}.`, "info");

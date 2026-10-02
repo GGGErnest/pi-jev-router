@@ -63,7 +63,7 @@ The virtual `auto/jev` model advertises the largest available configured route w
 
 Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.
 
-Optional tuning knobs (defaults shown): `evidence` is `"recent"` (up to eight recent user/assistant messages) or `"latest"` (only the newest user message); `pinFallback` is `false`, so a fallback chosen after an evaluation failure is provisional and re-routed on the next request, while `true` locks it for the session; `poorFitThreshold` is `0.85` and `skillProbability` is `0.8` (each `0`–`1`); `maxSkills` is `3`; `debug` is `false` and adds a safe failure label to warnings without exposing SDK error bodies; and `evaluationCost` sets the `inputPerMillion` (default `0.042`) and `outputPerMillion` (default `0`) rates used for the `/jev` estimate. Invalid values fail at load.
+Optional tuning knobs (defaults shown): `evidence` is `"recent"` (up to eight recent user/assistant messages) or `"latest"` (only the newest user message); `pinFallback` is `false`, so a fallback chosen after an evaluation failure is provisional and re-routed on the next request, while `true` locks it for the session; `poorFitThreshold` is `0.85` and `skillProbability` is `0.8` (each `0`–`1`); `maxSkills` is `3`; `debug` is `false` and adds a safe failure label to warnings without exposing SDK error bodies, and also records the full skill-relevance ranking on the session entry for auditing; and `evaluationCost` sets the `inputPerMillion` (default `0.042`) and `outputPerMillion` (default `0`) rates used for the `/jev` estimate. Invalid values fail at load.
 
 Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
 
@@ -164,6 +164,8 @@ nub run test
 Tests mock network responses; no API keys or paid requests are needed.
 
 The extension entry point is `index.ts` (Pi's wiring and the `auto/jev` provider). Pure logic lives in `src/`: `config.ts` (settings and validation), `effort.ts` (thinking profiles and Astra updates), `evidence.ts` (bounded/redacted request evidence), `evaluator.ts` (provider setup and retry classification), `skills.ts`, and shared `util.ts`/`errors.ts`.
+
+`node scripts/audit-skills.mjs` reports automatic skill-selection decisions (including empty ones) from session transcripts; with `debug: true` each decision also lists the probabilities Jev returned. See `--help`-style usage in the script header (`--all`, `--content`, or a session path).
 
 ## Publishing
 

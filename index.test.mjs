@@ -1756,3 +1756,28 @@ test("skillProbability and maxSkills bound automatic skill loading", async (t) =
 	assert.doesNotMatch(injected[0].content, /PRIVATE BODY for skill-a/);
 	assert.equal(requests.length, 1);
 });
+
+test("debug records the considered skill probabilities for auditing", async (t) => {
+	configureSkills(t, { debug: true });
+	const requests = mockSkillGateway(t, { "skill-a": 0.95, "skill-b": 0.4 });
+	const h = await harness();
+	await setSkills(h, [skillFixture("skill-a"), skillFixture("skill-b")]);
+	await skillContext(h, [user("Use a skill")]);
+	const entry = h.entries.find((e) => e.name === "jev-skills");
+	assert.deepEqual(entry.data.loaded.map((skill) => skill.name), ["skill-a"]);
+	assert.deepEqual(entry.data.considered, [
+		{ name: "skill-a", probability: 0.95 },
+		{ name: "skill-b", probability: 0.4 },
+	]);
+	assert.equal(entry.data.threshold, 0.8);
+	assert.equal(entry.data.maxSkills, 3);
+	assert.equal(requests.length, 1);
+	// Without debug the entry stays lean and does not retain the ranking.
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: {
+		options: { [FAST]: { description: "Routine" } }, fallback: FAST, skills: true,
+	} }));
+	const plain = await harness();
+	await setSkills(plain, [skillFixture("skill-a")]);
+	await skillContext(plain, [user("Use a skill")]);
+	assert.equal(plain.entries.find((e) => e.name === "jev-skills").data.considered, undefined);
+});
